@@ -1,7 +1,6 @@
 """Build or rebuild the codebase index."""
 
 import time
-from collections import Counter
 
 import click
 
@@ -15,11 +14,12 @@ from roam.output.formatter import to_json, json_envelope
 def index(ctx, force, verbose):
     """Build or rebuild the codebase index."""
     json_mode = ctx.obj.get('json') if ctx.obj else False
+    include_excluded = ctx.obj.get('include_excluded') if ctx.obj else False
     from roam.index.indexer import Indexer
     from roam.db.connection import open_db, db_exists
     t0 = time.monotonic()
     indexer = Indexer()
-    indexer.run(force=force, verbose=verbose)
+    indexer.run(force=force, verbose=verbose, include_excluded=include_excluded)
     elapsed = time.monotonic() - t0
 
     if not json_mode:

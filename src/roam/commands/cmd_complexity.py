@@ -5,11 +5,22 @@ functions/methods by cognitive complexity to identify the hardest-to-
 understand code in the project.
 """
 
+from __future__ import annotations
+
 import click
 
 from roam.db.connection import open_db
 from roam.commands.resolve import ensure_index
 from roam.output.formatter import loc, abbrev_kind, to_json, json_envelope
+
+
+def _safe_metric(row, key, default=0.0):
+    """Safely access a metric column that may not exist in older DBs."""
+    try:
+        v = row[key]
+        return v if v is not None else default
+    except (KeyError, IndexError):
+        return default
 
 
 def _severity(score: float) -> str:
@@ -53,6 +64,7 @@ def complexity(ctx, target, limit, threshold, by_file, bumpy_road):
     individually moderate but collectively hard to maintain.
     """
     json_mode = ctx.obj.get("json") if ctx.obj else False
+    sarif_mode = ctx.obj.get("sarif") if ctx.obj else False
     ensure_index()
 
     with open_db(readonly=True) as conn:
@@ -102,7 +114,29 @@ def complexity(ctx, target, limit, threshold, by_file, bumpy_road):
         ).fetchall()
 
         if not rows:
+            if sarif_mode:
+                from roam.output.sarif import complexity_to_sarif, write_sarif
+                sarif = complexity_to_sarif([], threshold=threshold or 0)
+                click.echo(write_sarif(sarif))
+                return
             click.echo("No matching symbols found.")
+            return
+
+        if sarif_mode:
+            from roam.output.sarif import complexity_to_sarif, write_sarif
+            complex_symbols = [
+                {
+                    "name": r["qualified_name"] or r["name"],
+                    "kind": r["kind"],
+                    "file": r["file_path"],
+                    "line": r["line_start"],
+                    "cognitive_complexity": r["cognitive_complexity"],
+                    "severity": _severity(r["cognitive_complexity"]),
+                }
+                for r in rows
+            ]
+            sarif = complexity_to_sarif(complex_symbols, threshold=threshold or 0)
+            click.echo(write_sarif(sarif))
             return
 
         if by_file:
@@ -144,6 +178,11 @@ def complexity(ctx, target, limit, threshold, by_file, bumpy_road):
                         "return_count": r["return_count"],
                         "bool_op_count": r["bool_op_count"],
                         "callback_depth": r["callback_depth"],
+                        "cyclomatic_density": _safe_metric(r, "cyclomatic_density"),
+                        "halstead_volume": _safe_metric(r, "halstead_volume"),
+                        "halstead_difficulty": _safe_metric(r, "halstead_difficulty"),
+                        "halstead_effort": _safe_metric(r, "halstead_effort"),
+                        "halstead_bugs": _safe_metric(r, "halstead_bugs"),
                         "severity": _severity(r["cognitive_complexity"]),
                     }
                     for r in rows
@@ -176,6 +215,12 @@ def complexity(ctx, target, limit, threshold, by_file, bumpy_road):
                 factors.append(f"params={r['param_count']}")
             if r["return_count"] >= 4:
                 factors.append(f"ret={r['return_count']}")
+            cd = _safe_metric(r, "cyclomatic_density")
+            if cd > 0.15:
+                factors.append(f"density={cd:.2f}")
+            hv = _safe_metric(r, "halstead_volume")
+            if hv > 500:
+                factors.append(f"H.vol={hv:.0f}")
 
             factor_str = f" ({', '.join(factors)})" if factors else ""
 

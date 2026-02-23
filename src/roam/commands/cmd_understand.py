@@ -1,5 +1,8 @@
 """Single-call codebase comprehension — everything an AI agent needs in one shot."""
 
+import fnmatch
+import re
+
 import click
 
 from roam.db.connection import open_db, find_project_root
@@ -36,6 +39,13 @@ _FRAMEWORK_PATTERNS = {
     # Rust
     "actix": (["actix-web"], []),
     "axum": (["axum"], []),
+    # .NET / C#
+    "asp.net": (["microsoft.aspnetcore"], []),
+    "entity-framework": (["microsoft.entityframeworkcore"], []),
+    "blazor": (["microsoft.aspnetcore.components"], []),
+    "wpf": (["system.windows"], []),
+    "winforms": (["system.windows.forms"], []),
+    "xamarin": (["xamarin.forms", "xamarin.essentials"], []),
 }
 
 _BUILD_PATTERNS = {
@@ -50,12 +60,13 @@ _BUILD_PATTERNS = {
     "gradle": ["build.gradle*"],
     "pip": ["pyproject.toml", "setup.py", "setup.cfg"],
     "composer": ["composer.json"],
+    "dotnet": ["*.csproj", "*.sln", "*.fsproj", "*.vbproj"],
 }
 
 
 def _detect_frameworks(conn):
-    """Detect frameworks by scanning edge targets and file names."""
-    # Collect all unique edge target names (imports/references)
+    """Detect frameworks by scanning edge targets, file names, and source content."""
+    # collect unique edge target names from resolved references
     import_targets = set()
     for r in conn.execute(
         "SELECT DISTINCT s.name FROM symbols s "
@@ -63,7 +74,33 @@ def _detect_frameworks(conn):
     ).fetchall():
         import_targets.add(r["name"].lower())
 
-    # Also collect file paths for pattern matching
+    # scan a sample of source files for import/using statements that reference
+    # external packages (these won't appear in resolved edges since the
+    # framework symbols aren't in the local codebase)
+    _IMPORT_RE = re.compile(
+        r'\busing\s+([\w.]+)'       # C#: using Microsoft.AspNetCore.Mvc;
+        r'|\bfrom\s+[\'"]([^"\']+)[\'"]'  # JS/TS: from 'next/router'
+        r'|\bimport\s+([\w.]+)'     # Python/Go: import x
+        r'|\bfrom\s+([\w.]+)\s+import'    # Python: from x import y
+    )
+    root = find_project_root()
+    for r in conn.execute(
+        "SELECT path FROM files WHERE language IS NOT NULL LIMIT 200"
+    ).fetchall():
+        file_path = root / r["path"]
+        if not file_path.exists():
+            continue
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="ignore").lower()
+            for match in _IMPORT_RE.finditer(content):
+                # groups are mutually exclusive; pick the one that matched
+                val = match.group(1) or match.group(2) or match.group(3) or match.group(4)
+                if val:
+                    import_targets.add(val)
+        except Exception:
+            pass
+
+    # collect file paths for pattern matching
     file_paths = set()
     for r in conn.execute("SELECT path FROM files").fetchall():
         file_paths.add(r["path"].replace("\\", "/").lower())
@@ -72,12 +109,11 @@ def _detect_frameworks(conn):
     for name, (import_pats, file_pats) in _FRAMEWORK_PATTERNS.items():
         found = False
         for pat in import_pats:
-            if any(pat.lower() in t for t in import_targets):
+            if _matches_import_pattern(pat.lower(), import_targets):
                 found = True
                 break
         if not found:
             for pat in file_pats:
-                import fnmatch
                 if any(fnmatch.fnmatch(fp.split("/")[-1], pat.lower()) for fp in file_paths):
                     found = True
                     break
@@ -85,6 +121,27 @@ def _detect_frameworks(conn):
             detected.append(name)
 
     return detected
+
+
+def _matches_import_pattern(pattern: str, targets: set) -> bool:
+    """check if pattern matches any target as a prefix or path segment.
+
+    examples:
+      - pattern "next" matches "next" or "next/router" but NOT "getnextpage"
+      - pattern "react" matches "react" or "react-dom" but NOT "somereactiveext"
+      - pattern "microsoft.aspnetcore" matches "microsoft.aspnetcore.mvc"
+    """
+    for target in targets:
+        # exact match
+        if target == pattern:
+            return True
+        # prefix match with delimiter (/, ., -, @)
+        # handles: "next/router", "react-dom", "@angular/core", "microsoft.aspnetcore.mvc"
+        if target.startswith(pattern) and len(target) > len(pattern):
+            next_char = target[len(pattern)]
+            if next_char in (".", "/", "-", "@"):
+                return True
+    return False
 
 
 def _detect_build(conn):
@@ -96,7 +153,6 @@ def _detect_build(conn):
 
     for tool, patterns in _BUILD_PATTERNS.items():
         for pat in patterns:
-            import fnmatch
             if any(fnmatch.fnmatch(fn, pat.lower()) for fn in file_names):
                 return tool
     return None
@@ -261,7 +317,6 @@ def _suggest_reading_order(conn, entry_points, key_abstractions, hotspots):
 
 def _detect_conventions(conn):
     """Detect dominant naming conventions per symbol kind."""
-    import re
     _SNAKE = re.compile(r'^[a-z_][a-z0-9_]*$')
     _CAMEL = re.compile(r'^[a-z][a-zA-Z0-9]*$')
     _PASCAL = re.compile(r'^[A-Z][a-zA-Z0-9]*$')
@@ -568,101 +623,104 @@ def understand(ctx, full):
             )))
             return
 
-        # --- Compact text output ---
-        # Language summary
-        lang_str = ", ".join(f"{l['name']} ({l['files']})" for l in languages[:5])
-        if len(languages) > 5:
-            lang_str += f" +{len(languages) - 5} more"
+        _understand_text(
+            root, file_count, sym_count, edge_count, languages,
+            frameworks, build_tool, layers, clusters_data, health,
+            worst, key_abs, entry_points, hotspots, conventions_summary,
+            complexity_summary, patterns_detected, debt_hotspots, reading_order,
+        )
 
-        fw_str = ", ".join(frameworks) if frameworks else "none detected"
-        build_str = build_tool or "unknown"
 
-        click.echo(f"=== {root.name} ===\n")
-        click.echo(f"Project: {file_count} files, {sym_count} symbols, {edge_count} edges")
-        click.echo(f"Languages: {lang_str}")
-        click.echo(f"Stack: {fw_str} | Build: {build_str}")
-        click.echo(f"Architecture: {len(layers)} layers, {len(clusters_data)} clusters")
-        click.echo(f"Health: {health['health_score']}/100"
-                    f" — {', '.join(worst) if worst else 'no critical issues'}")
+def _understand_text(
+    root, file_count, sym_count, edge_count, languages,
+    frameworks, build_tool, layers, clusters_data, health,
+    worst, key_abs, entry_points, hotspots, conventions_summary,
+    complexity_summary, patterns_detected, debt_hotspots, reading_order,
+):
+    """Emit compact text output for the understand command."""
+    lang_str = ", ".join(f"{l['name']} ({l['files']})" for l in languages[:5])
+    if len(languages) > 5:
+        lang_str += f" +{len(languages) - 5} more"
+
+    fw_str = ", ".join(frameworks) if frameworks else "none detected"
+    build_str = build_tool or "unknown"
+
+    click.echo(f"=== {root.name} ===\n")
+    click.echo(f"Project: {file_count} files, {sym_count} symbols, {edge_count} edges")
+    click.echo(f"Languages: {lang_str}")
+    click.echo(f"Stack: {fw_str} | Build: {build_str}")
+    click.echo(f"Architecture: {len(layers)} layers, {len(clusters_data)} clusters")
+    click.echo(f"Health: {health['health_score']}/100"
+                f" — {', '.join(worst) if worst else 'no critical issues'}")
+    click.echo()
+
+    click.echo(f"Key abstractions ({len(key_abs)}):")
+    for ka in key_abs[:10]:
+        click.echo(f"  {abbrev_kind(ka['kind'])}  {ka['name']:<40s}  "
+                    f"fan_in={ka['fan_in']:<3d}  {ka['location']}")
+    if len(key_abs) > 10:
+        click.echo(f"  (+{len(key_abs) - 10} more)")
+    click.echo()
+
+    if entry_points:
+        click.echo(f"Entry points ({len(entry_points)}):")
+        for ep in entry_points[:5]:
+            click.echo(f"  {ep['path']:<50s}  ({ep['symbols']} syms)")
         click.echo()
 
-        # Key abstractions
-        click.echo(f"Key abstractions ({len(key_abs)}):")
-        for ka in key_abs[:10]:
-            click.echo(f"  {abbrev_kind(ka['kind'])}  {ka['name']:<40s}  "
-                        f"fan_in={ka['fan_in']:<3d}  {ka['location']}")
-        if len(key_abs) > 10:
-            click.echo(f"  (+{len(key_abs) - 10} more)")
+    if clusters_data:
+        click.echo(f"Clusters ({len(clusters_data)}):")
+        for cl in clusters_data[:8]:
+            syms = ", ".join(cl["top_symbols"][:4])
+            more = f" +{cl['size'] - 4}" if cl["size"] > 4 else ""
+            click.echo(f"  {cl['label']:<30s}  {cl['size']:>3d} syms  [{syms}{more}]")
+        if len(clusters_data) > 8:
+            click.echo(f"  (+{len(clusters_data) - 8} more)")
         click.echo()
 
-        # Entry points
-        if entry_points:
-            click.echo(f"Entry points ({len(entry_points)}):")
-            for ep in entry_points[:5]:
-                click.echo(f"  {ep['path']:<50s}  ({ep['symbols']} syms)")
-            click.echo()
+    if hotspots:
+        click.echo(f"Hotspots ({len(hotspots)}):")
+        for hs in hotspots[:5]:
+            click.echo(f"  {hs['path']:<50s}  churn={hs['churn']:<5d}  "
+                        f"authors={hs['authors']}  coupling={hs['coupling_partners']}")
+        click.echo()
 
-        # Clusters
-        if clusters_data:
-            click.echo(f"Clusters ({len(clusters_data)}):")
-            for cl in clusters_data[:8]:
-                syms = ", ".join(cl["top_symbols"][:4])
-                more = f" +{cl['size'] - 4}" if cl["size"] > 4 else ""
-                click.echo(f"  {cl['label']:<30s}  {cl['size']:>3d} syms  [{syms}{more}]")
-            if len(clusters_data) > 8:
-                click.echo(f"  (+{len(clusters_data) - 8} more)")
-            click.echo()
+    if conventions_summary:
+        parts = [f"{kind}: {info['style']} ({info['pct']:.0f}%)"
+                 for kind, info in conventions_summary.items()]
+        click.echo(f"Conventions: {', '.join(parts)}")
+        click.echo()
 
-        # Hotspots
-        if hotspots:
-            click.echo(f"Hotspots ({len(hotspots)}):")
-            for hs in hotspots[:5]:
-                click.echo(f"  {hs['path']:<50s}  churn={hs['churn']:<5d}  "
-                            f"authors={hs['authors']}  coupling={hs['coupling_partners']}")
-            click.echo()
+    if complexity_summary:
+        click.echo(
+            f"Complexity: {complexity_summary['total_analyzed']} functions, "
+            f"avg={complexity_summary['avg']}, "
+            f"{complexity_summary['critical']} critical, "
+            f"{complexity_summary['high']} high"
+        )
+        if complexity_summary["worst"]:
+            worst_names = ", ".join(
+                f"{w['name']}({w['cc']})" for w in complexity_summary["worst"][:3]
+            )
+            click.echo(f"  Worst: {worst_names}")
+        click.echo()
 
-        # Conventions
-        if conventions_summary:
-            parts = []
-            for kind, info in conventions_summary.items():
-                parts.append(f"{kind}: {info['style']} ({info['pct']:.0f}%)")
-            click.echo(f"Conventions: {', '.join(parts)}")
-            click.echo()
+    if patterns_detected:
+        pat_str = ", ".join(
+            f"{p['type']}: {p['name']} ({p['count']})" for p in patterns_detected
+        )
+        click.echo(f"Patterns: {pat_str}")
+        click.echo()
 
-        # Complexity
-        if complexity_summary:
+    if debt_hotspots:
+        click.echo("Debt hotspots:")
+        for d in debt_hotspots:
             click.echo(
-                f"Complexity: {complexity_summary['total_analyzed']} functions, "
-                f"avg={complexity_summary['avg']}, "
-                f"{complexity_summary['critical']} critical, "
-                f"{complexity_summary['high']} high"
+                f"  {d['path']:<50s}  "
+                f"complexity={d['complexity']:<6}  churn={d['churn']}"
             )
-            if complexity_summary["worst"]:
-                worst_names = ", ".join(
-                    f"{w['name']}({w['cc']})" for w in complexity_summary["worst"][:3]
-                )
-                click.echo(f"  Worst: {worst_names}")
-            click.echo()
+        click.echo()
 
-        # Patterns
-        if patterns_detected:
-            pat_str = ", ".join(
-                f"{p['type']}: {p['name']} ({p['count']})" for p in patterns_detected
-            )
-            click.echo(f"Patterns: {pat_str}")
-            click.echo()
-
-        # Debt
-        if debt_hotspots:
-            click.echo(f"Debt hotspots:")
-            for d in debt_hotspots:
-                click.echo(
-                    f"  {d['path']:<50s}  "
-                    f"complexity={d['complexity']:<6}  churn={d['churn']}"
-                )
-            click.echo()
-
-        # Reading order
-        click.echo(f"Suggested reading order:")
-        for ro in reading_order:
-            click.echo(f"  {ro['priority']:>2d}. {ro['path']:<50s}  ({ro['reason']})")
+    click.echo("Suggested reading order:")
+    for ro in reading_order:
+        click.echo(f"  {ro['priority']:>2d}. {ro['path']:<50s}  ({ro['reason']})")

@@ -25,9 +25,11 @@ def detect_layers(G: nx.DiGraph) -> dict[int, int]:
     node_to_scc: dict[int, int] = condensation.graph["mapping"]
 
     # Compute layers on the condensed DAG
+    topo_order = list(nx.topological_sort(condensation))
+    pred_map = {n: list(condensation.predecessors(n)) for n in topo_order}
     scc_layers: dict[int, int] = {}
-    for scc_node in nx.topological_sort(condensation):
-        preds = list(condensation.predecessors(scc_node))
+    for scc_node in topo_order:
+        preds = pred_map[scc_node]
         if not preds:
             scc_layers[scc_node] = 0
         else:
@@ -52,24 +54,33 @@ def find_violations(
     layer L_src to a node at layer L_tgt where L_tgt < L_src is a
     potential violation (a lower layer depending on a higher one).
 
+    Each violation includes a ``severity`` weight proportional to the
+    layer distance jumped.  Crossing many layers (e.g., L7 → L1) is
+    architecturally worse than a single-layer skip (L2 → L1).
+
     Returns a list of dicts::
 
-        [{"source": id, "target": id, "source_layer": int, "target_layer": int}]
+        [{"source": id, "target": id, "source_layer": int, "target_layer": int,
+          "layer_distance": int, "severity": float}]
     """
     violations: list[dict] = []
+    max_layer = max(layers.values(), default=0) or 1
     for src, tgt in G.edges:
         src_layer = layers.get(src)
         tgt_layer = layers.get(tgt)
         if src_layer is None or tgt_layer is None:
             continue
-        # A violation: an edge from a higher layer going down to a lower layer
-        # (i.e., a higher-level module depends on something it provides to)
         if src_layer > tgt_layer:
+            distance = src_layer - tgt_layer
+            # Severity normalized by max possible distance, so it's in [0, 1]
+            severity = round(distance / max_layer, 3)
             violations.append({
                 "source": src,
                 "target": tgt,
                 "source_layer": src_layer,
                 "target_layer": tgt_layer,
+                "layer_distance": distance,
+                "severity": severity,
             })
     return violations
 

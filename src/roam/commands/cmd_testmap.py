@@ -1,27 +1,14 @@
 """Map symbols/files to their test coverage."""
 
-import os
+from __future__ import annotations
+
 
 import click
 
 from roam.db.connection import open_db
 from roam.output.formatter import abbrev_kind, loc, format_edge_kind, to_json, json_envelope
 from roam.commands.resolve import ensure_index, find_symbol
-
-
-TEST_PATTERNS_NAME = ["test_", "_test.", ".test.", ".spec.", "Test.cls", "_Test.cls"]
-TEST_PATTERNS_DIR = ["tests/", "test/", "__tests__/", "spec/"]
-
-
-def _is_test_file(path):
-    """Check if a file path matches test naming conventions."""
-    p = path.replace("\\", "/")
-    basename = os.path.basename(p)
-    if any(pat in basename for pat in TEST_PATTERNS_NAME):
-        return True
-    if any(d in p for d in TEST_PATTERNS_DIR):
-        return True
-    return False
+from roam.commands.changed_files import is_test_file as _is_test_file
 
 
 def _test_map_symbol(conn, sym):
@@ -172,7 +159,7 @@ def _test_map_file(conn, path):
             (frow["id"],),
         ).fetchall()
         if risky:
-            click.echo(f"\nSuggested symbols to test (by importance):")
+            click.echo("\nSuggested symbols to test (by importance):")
             for r in risky:
                 pr = r["pagerank"] or 0
                 click.echo(f"  {abbrev_kind(r['kind'])}  {r['name']}  (PR={pr:.4f}, in={r['in_degree']})")

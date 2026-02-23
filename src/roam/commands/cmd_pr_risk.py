@@ -1,6 +1,10 @@
 """Compute risk score for pending changes."""
 
+from __future__ import annotations
+
+import math
 import subprocess
+import time
 
 import click
 
@@ -33,15 +37,235 @@ def _get_file_stat(root, path):
     return 0, 0
 
 
+def _detect_author():
+    """Auto-detect author name from git config. Returns None if undetectable."""
+    try:
+        result = subprocess.run(
+            ["git", "config", "user.name"],
+            capture_output=True, text=True, timeout=5,
+            encoding="utf-8", errors="replace",
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _percentile(sorted_values, pct):
+    """Linear-interpolated percentile from a sorted numeric list."""
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    k = (len(sorted_values) - 1) * (pct / 100.0)
+    lo = int(math.floor(k))
+    hi = int(math.ceil(k))
+    if lo == hi:
+        return float(sorted_values[lo])
+    frac = k - lo
+    return float(sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * frac)
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _smoothstep01(x: float) -> float:
+    """Smooth interpolation in [0,1] with flatter tails."""
+    x = _clamp01(x)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _calibrated_hotspot_score(avg_changed_churn: float, repo_churn_sorted: list[float]) -> float:
+    """Map changed-file churn to [0,1] using repo-relative percentiles.
+
+    - 0.0 at roughly repo median churn
+    - 1.0 around repo p90 churn
+    - Smooth interpolation between
+    """
+    if avg_changed_churn <= 0 or not repo_churn_sorted:
+        return 0.0
+
+    p50 = _percentile(repo_churn_sorted, 50)
+    p90 = _percentile(repo_churn_sorted, 90)
+
+    if p90 <= p50:
+        # Degenerate distribution fallback.
+        denom = max(1.0, p50 * 3.0)
+        return _clamp01(avg_changed_churn / denom)
+
+    if avg_changed_churn <= p50:
+        raw = 0.5 * (avg_changed_churn / max(p50, 1.0))
+    else:
+        raw = 0.5 + 0.5 * ((avg_changed_churn - p50) / (p90 - p50))
+    return _smoothstep01(raw)
+
+
+def _author_count_risk(author_counts: list[int]) -> float:
+    """Continuous bus-factor risk from distinct-author counts per file.
+
+    Per-file risk is 1/N authors, then averaged across changed files.
+    This preserves intuitive anchors:
+      N=1 -> 1.0, N=2 -> 0.5, N=4 -> 0.25.
+    """
+    if not author_counts:
+        return 0.0
+    inv_counts = [1.0 / max(c, 1) for c in author_counts]
+    return _clamp01(sum(inv_counts) / len(inv_counts))
+
+
+def _author_familiarity(conn, author, changed_files):
+    """Calculate how familiar the author is with each changed file.
+
+    familiarity(author, file) = sum(
+        (lines_added + lines_removed) * exp(-0.005 * days_since)
+        for each commit by author to file
+    )
+    normalized = author_familiarity / max(all_authors_familiarity_for_file)
+    familiarity_risk = 1.0 - avg(normalized across changed files)
+
+    Half-life: ~139 days (4.6 months).
+    Returns: (risk_score 0-0.25, details_dict)
+    """
+    now = int(time.time())
+    decay_rate = 0.005  # per day; half-life ~139 days
+
+    normalized_scores = []
+    file_details = []
+
+    for path, fid in changed_files.items():
+        if is_test_file(path) or is_low_risk_file(path):
+            continue
+
+        # Get all commits touching this file with per-author churn
+        rows = conn.execute(
+            "SELECT gc.author, gc.timestamp, gfc.lines_added, gfc.lines_removed "
+            "FROM git_file_changes gfc "
+            "JOIN git_commits gc ON gfc.commit_id = gc.id "
+            "WHERE gfc.file_id = ?",
+            (fid,),
+        ).fetchall()
+
+        if not rows:
+            # No git history for this file — treat as unfamiliar
+            normalized_scores.append(0.0)
+            file_details.append({"file": path, "familiarity": 0.0})
+            continue
+
+        # Accumulate time-decayed churn per author
+        author_familiarity = {}
+        for r in rows:
+            a = r["author"] or ""
+            days_since = max(0, (now - (r["timestamp"] or 0)) / 86400)
+            churn = (r["lines_added"] or 0) + (r["lines_removed"] or 0)
+            weight = churn * math.exp(-decay_rate * days_since)
+            author_familiarity[a] = author_familiarity.get(a, 0.0) + weight
+
+        max_fam = max(author_familiarity.values()) if author_familiarity else 0.0
+        my_fam = author_familiarity.get(author, 0.0)
+
+        if max_fam > 0:
+            norm = my_fam / max_fam
+        else:
+            norm = 0.0
+
+        normalized_scores.append(norm)
+        file_details.append({
+            "file": path,
+            "familiarity": round(norm, 3),
+        })
+
+    if not normalized_scores:
+        return 0.0, {"avg_familiarity": 1.0, "files_assessed": 0, "files": []}
+
+    avg_norm = sum(normalized_scores) / len(normalized_scores)
+    familiar_count = sum(1 for s in normalized_scores if s >= 0.5)
+    risk = (1.0 - avg_norm) * 0.25  # scale to 0-0.25
+
+    details = {
+        "avg_familiarity": round(avg_norm, 3),
+        "files_assessed": len(normalized_scores),
+        "files_familiar": familiar_count,
+        "files": file_details,
+    }
+    return risk, details
+
+
+def _minor_contributor_risk(conn, author, changed_files):
+    """Check if author is a minor contributor to each changed file.
+
+    Minor = author's churn < 5% of file's total_churn.
+    Fraction of "minor" files * 0.15 = risk contribution.
+    Returns: (risk_score 0-0.15, details_dict)
+    """
+    minor_count = 0
+    assessed = 0
+    file_details = []
+
+    for path, fid in changed_files.items():
+        if is_test_file(path) or is_low_risk_file(path):
+            continue
+
+        # Get total churn for this file
+        fs_row = conn.execute(
+            "SELECT total_churn FROM file_stats WHERE file_id = ?", (fid,),
+        ).fetchone()
+        total_churn = (fs_row["total_churn"] or 0) if fs_row else 0
+
+        if total_churn == 0:
+            # No churn data — can't assess, skip
+            continue
+
+        # Get author's churn on this file
+        author_row = conn.execute(
+            "SELECT COALESCE(SUM(gfc.lines_added), 0) + COALESCE(SUM(gfc.lines_removed), 0) AS churn "
+            "FROM git_file_changes gfc "
+            "JOIN git_commits gc ON gfc.commit_id = gc.id "
+            "WHERE gfc.file_id = ? AND gc.author = ?",
+            (fid, author),
+        ).fetchone()
+        author_churn = author_row["churn"] if author_row else 0
+
+        assessed += 1
+        is_minor = author_churn < (total_churn * 0.05)
+        if is_minor:
+            minor_count += 1
+
+        file_details.append({
+            "file": path,
+            "author_churn": author_churn,
+            "total_churn": total_churn,
+            "pct": round(author_churn * 100 / total_churn, 1) if total_churn else 0,
+            "is_minor": is_minor,
+        })
+
+    if assessed == 0:
+        return 0.0, {"minor_files": 0, "files_assessed": 0, "files": []}
+
+    minor_frac = minor_count / assessed
+    risk = minor_frac * 0.15
+
+    details = {
+        "minor_files": minor_count,
+        "files_assessed": assessed,
+        "minor_fraction": round(minor_frac, 3),
+        "files": file_details,
+    }
+    return risk, details
+
+
 @click.command("pr-risk")
 @click.argument('commit_range', required=False, default=None)
 @click.option('--staged', is_flag=True, help='Analyze staged changes')
+@click.option('--author', default=None, help='Author name (auto-detects via git config if omitted)')
 @click.pass_context
-def pr_risk(ctx, commit_range, staged):
+def pr_risk(ctx, commit_range, staged, author):
     """Compute risk score for pending changes.
 
     Analyzes blast radius, hotspot churn, bus factor, test coverage,
-    and coupling to produce a single 0-100 risk score.
+    coupling, author familiarity, and minor-contributor status to
+    produce a single 0-100 risk score.
 
     Pass a COMMIT_RANGE (e.g. HEAD~3..HEAD) for committed changes,
     or use --staged for staged changes. Default: unstaged changes.
@@ -75,6 +299,9 @@ def pr_risk(ctx, commit_range, staged):
         total_syms_repo = conn.execute(
             "SELECT COUNT(*) FROM symbols"
         ).fetchone()[0]
+
+        # --- Resolve author for familiarity/minor-contributor factors ---
+        resolved_author = author or _detect_author()
 
         # --- 1. Blast radius ---
         from roam.graph.builder import build_symbol_graph
@@ -111,20 +338,27 @@ def pr_risk(ctx, commit_range, staged):
                 }
 
         if churn_data:
-            # Compare against repo median churn — exclude docs/config files
+            # Repo-relative calibration: compare changed churn against
+            # code-file churn percentiles (median..p90), not fixed cutoffs.
             code_churn = {p: d for p, d in churn_data.items() if not is_low_risk_file(p)}
-            all_churn = conn.execute(
-                "SELECT total_churn FROM file_stats ORDER BY total_churn"
+            repo_churn_rows = conn.execute(
+                "SELECT f.path, fs.total_churn FROM file_stats fs "
+                "JOIN files f ON fs.file_id = f.id "
+                "WHERE fs.total_churn IS NOT NULL"
             ).fetchall()
-            if all_churn and code_churn:
-                median_churn = all_churn[len(all_churn) // 2]["total_churn"]
-                if median_churn > 0:
-                    avg_changed = sum(d["churn"] for d in code_churn.values()) / len(code_churn)
-                    hotspot_score = min(1.0, avg_changed / (median_churn * 3))
+            repo_code_churn = sorted(
+                float(r["total_churn"] or 0)
+                for r in repo_churn_rows
+                if (r["total_churn"] or 0) > 0 and not is_low_risk_file(r["path"])
+            )
+            if repo_code_churn and code_churn:
+                avg_changed = sum(d["churn"] for d in code_churn.values()) / len(code_churn)
+                hotspot_score = _calibrated_hotspot_score(avg_changed, repo_code_churn)
 
         # --- 3. Bus factor ---
         bus_factor_risk = 0.0
-        bus_factors = []
+        min_bf = None
+        author_counts = []
         for path, fid in file_map.items():
             if is_test_file(path) or is_low_risk_file(path):
                 continue
@@ -134,16 +368,11 @@ def pr_risk(ctx, commit_range, staged):
                 "WHERE gfc.file_id = ?", (fid,)
             ).fetchall()
             if authors:
-                bus_factors.append(len(authors))
+                author_counts.append(len(authors))
 
-        if bus_factors:
-            min_bf = min(bus_factors)
-            if min_bf == 1:
-                bus_factor_risk = 1.0
-            elif min_bf == 2:
-                bus_factor_risk = 0.5
-            else:
-                bus_factor_risk = 0.0
+        if author_counts:
+            min_bf = min(author_counts)
+            bus_factor_risk = _author_count_risk(author_counts)
 
         # --- 4. Test coverage ---
         test_coverage = 0.0
@@ -153,12 +382,6 @@ def pr_risk(ctx, commit_range, staged):
         for path in source_files:
             fid = file_map[path]
             # Check if any test file imports this file
-            test_importer = conn.execute(
-                "SELECT 1 FROM file_edges fe "
-                "JOIN files f ON fe.source_file_id = f.id "
-                "WHERE fe.target_file_id = ?",
-                (fid,),
-            ).fetchall()
             has_test = any(is_test_file(r["path"]) for r in conn.execute(
                 "SELECT f.path FROM file_edges fe "
                 "JOIN files f ON fe.source_file_id = f.id "
@@ -229,16 +452,42 @@ def pr_risk(ctx, commit_range, staged):
             for e in exports:
                 new_dead.append({"name": e["name"], "kind": e["kind"], "file": path})
 
+        # --- 9. Author familiarity ---
+        familiarity_risk = 0.0
+        familiarity_details = {"avg_familiarity": 1.0, "files_assessed": 0, "files": []}
+        if resolved_author:
+            familiarity_risk, familiarity_details = _author_familiarity(
+                conn, resolved_author, file_map,
+            )
+
+        # --- 10. Minor contributor risk ---
+        minor_risk = 0.0
+        minor_details = {"minor_files": 0, "files_assessed": 0, "files": []}
+        if resolved_author:
+            minor_risk, minor_details = _minor_contributor_risk(
+                conn, resolved_author, file_map,
+            )
+
         # --- Composite risk score (0-100) ---
-        risk = int(
-            min(blast_pct, 25) +                      # 0-25: blast radius
-            hotspot_score * 20 +                       # 0-20: hotspot
-            (1 - test_coverage) * 20 +                 # 0-20: untested
-            bus_factor_risk * 12 +                     # 0-12: bus factor
-            coupling_score * 15 +                      # 0-15: coupling
-            novelty * 8                                # 0-8: change set novelty
-        )
-        risk = min(risk, 100)
+        # Multiplicative model: each factor amplifies the base risk.
+        # This captures interaction effects — high blast + untested is
+        # exponentially worse than either alone, not just linearly worse.
+        # log-space combination: risk = 100 * (1 - product(1 - factor_i))
+        _factors = [
+            min(blast_pct / 100, 0.40),          # blast radius (up to 40%)
+            hotspot_score * 0.30,                  # hotspot (up to 30%)
+            (1 - test_coverage) * 0.30,            # untested (up to 30%)
+            bus_factor_risk * 0.20,                # bus factor (up to 20%)
+            coupling_score * 0.20,                 # coupling (up to 20%)
+            novelty * 0.15,                        # novelty (up to 15%)
+            familiarity_risk,                      # author familiarity (up to 25%)
+            minor_risk,                            # minor contributor (up to 15%)
+        ]
+        # Product of (1 - factor): probability of "no risk" from each
+        no_risk = 1.0
+        for f in _factors:
+            no_risk *= (1 - max(0, min(f, 0.99)))
+        risk = int(min(100, (1 - no_risk) * 100))
 
         if risk <= 25:
             level = "LOW"
@@ -322,6 +571,9 @@ def pr_risk(ctx, commit_range, staged):
                 layers_touched=len(touched_layers),
                 total_layers=total_layers,
                 dead_exports=len(new_dead),
+                familiarity=familiarity_details,
+                minor_risk=minor_details,
+                author=resolved_author,
                 per_file=per_file,
                 suggested_reviewers=[
                     {"author": a, "lines": l} for a, l in top_authors
@@ -341,10 +593,24 @@ def pr_risk(ctx, commit_range, staged):
         click.echo(f"  Hotspot score: {hotspot_score * 100:5.1f}%  {'(hot files!)' if hotspot_score > 0.5 else ''}")
         click.echo(f"  Test coverage: {test_coverage * 100:5.1f}%  ({covered_files}/{len(source_files)} source files covered)")
         click.echo(f"  Bus factor:    {'RISK' if bus_factor_risk >= 0.5 else 'ok':>5s}  "
-                    f"{'(single-author file!)' if bus_factor_risk >= 1.0 else ''}")
+                    f"{'(single-author file!)' if min_bf == 1 else ''}")
         click.echo(f"  Coupling:      {coupling_score * 100:5.1f}%")
         click.echo(f"  Novelty:       {novelty * 100:5.1f}%"
                     f"{'  (unfamiliar change combination!)' if novelty > 0.7 else ''}")
+        if resolved_author:
+            fam_avg = familiarity_details.get("avg_familiarity", 1.0)
+            fam_assessed = familiarity_details.get("files_assessed", 0)
+            fam_known = familiarity_details.get("files_familiar", 0)
+            click.echo(f"  Familiarity:   {fam_avg * 100:5.1f}%"
+                        f"  (author knows {fam_known}/{fam_assessed} changed files well)")
+            minor_files = minor_details.get("minor_files", 0)
+            minor_assessed = minor_details.get("files_assessed", 0)
+            if minor_files > 0:
+                click.echo(f"  Minor risk:    {minor_risk * 100:5.1f}%"
+                            f"  (author is minor contributor to {minor_files}/{minor_assessed} files)")
+            else:
+                click.echo("  Minor risk:      0.0%"
+                            "  (author is major contributor to all files)")
         if total_clusters > 1:
             click.echo(f"  Cluster spread: {len(cluster_ids)}/{total_clusters} clusters touched")
         if total_layers > 1:
@@ -378,6 +644,6 @@ def pr_risk(ctx, commit_range, staged):
                 click.echo(f"  (+{len(new_dead) - 10} more)")
 
         if top_authors:
-            click.echo(f"\nSuggested reviewers:")
-            for author, lines in top_authors:
-                click.echo(f"  {author:<30s} ({lines} lines contributed)")
+            click.echo("\nSuggested reviewers:")
+            for rev_author, lines in top_authors:
+                click.echo(f"  {rev_author:<30s} ({lines} lines contributed)")

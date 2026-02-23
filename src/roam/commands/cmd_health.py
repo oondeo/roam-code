@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import math
+
 import click
 
 from roam.db.connection import open_db, batched_in
 from roam.db.queries import TOP_BY_DEGREE, TOP_BY_BETWEENNESS
 from roam.graph.builder import build_symbol_graph
-from roam.graph.cycles import find_cycles, find_weakest_edge, format_cycles
+from roam.graph.cycles import find_cycles, find_weakest_edge, format_cycles, propagation_cost, algebraic_connectivity
 from roam.graph.layers import detect_layers, find_violations
 from roam.output.formatter import (
-    abbrev_kind, loc, section, format_table, truncate_lines, to_json,
+    abbrev_kind, loc, format_table, to_json,
     json_envelope,
 )
 from roam.commands.resolve import ensure_index
@@ -50,21 +52,46 @@ _FRAMEWORK_NAMES = frozenset({
 _UTILITY_PATH_PATTERNS = (
     "composables/", "utils/", "services/", "lib/", "helpers/",
     "shared/", "config/", "core/", "hooks/", "stores/",
+    "output/", "db/", "common/", "internal/", "infra/",
+)
+
+_UTILITY_FILE_PATTERNS = (
+    "resolve.py", "helpers.py", "common.py", "base.py",
+)
+
+# Paths that are NOT production code — treat as expected utilities
+_NON_PRODUCTION_PATH_PATTERNS = (
+    "tests/", "test/", "__tests__/", "spec/",
+    "dev/", "scripts/", "bin/", "benchmark/",
+    "conftest.py",
 )
 
 
 def _is_utility_path(file_path):
-    """Check if a file is in a utility/infrastructure directory."""
+    """Check if a file is in a utility/infrastructure directory or is a known utility file."""
     p = file_path.replace("\\", "/").lower()
-    return any(pat in p for pat in _UTILITY_PATH_PATTERNS)
+    if any(pat in p for pat in _UTILITY_PATH_PATTERNS):
+        return True
+    if any(pat in p for pat in _NON_PRODUCTION_PATH_PATTERNS):
+        return True
+    basename = p.rsplit("/", 1)[-1] if "/" in p else p
+    return basename in _UTILITY_FILE_PATTERNS
 
 
 def _percentile(sorted_values, pct):
-    """Return the value at the given percentile (0-100) from a sorted list."""
+    """Linear-interpolated percentile from a sorted numeric list."""
     if not sorted_values:
         return 0
-    idx = int(pct / 100 * len(sorted_values))
-    return sorted_values[min(idx, len(sorted_values) - 1)]
+    n = len(sorted_values)
+    if n == 1:
+        return sorted_values[0]
+    k = (n - 1) * (pct / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, n - 1)
+    if lo == hi:
+        return sorted_values[lo]
+    frac = k - lo
+    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * frac
 
 
 def _unique_dirs(file_paths):
@@ -87,6 +114,7 @@ def _unique_dirs(file_paths):
 def health(ctx, no_framework):
     """Show code health: cycles, god components, bottlenecks."""
     json_mode = ctx.obj.get('json') if ctx.obj else False
+    sarif_mode = ctx.obj.get('sarif') if ctx.obj else False
     ensure_index()
     with open_db(readonly=True) as conn:
         G = build_symbol_graph(conn)
@@ -256,23 +284,53 @@ def health(ctx, no_framework):
             cycle_symbol_ids.update(scc)
         tangle_ratio = round(len(cycle_symbol_ids) / total_symbols * 100, 1)
 
+        # --- Propagation Cost (MacCormack et al. 2006) ---
+        # Fraction of the system affected by a change to any component.
+        # Uses transitive closure: PC = sum(V) / n^2
+        prop_cost = propagation_cost(G)
+
+        # --- Algebraic Connectivity (Fiedler 1973) ---
+        # Second-smallest Laplacian eigenvalue; low = fragile architecture
+        fiedler = algebraic_connectivity(G)
+
         # --- Composite health score (0-100) ---
-        health_score = 100
-        health_score -= min(30, tangle_ratio * 1.5)
+        # Weighted geometric mean: score = 100 * product(h_i ^ w_i)
+        # Non-compensatory: a zero in any dimension cannot be masked by
+        # high scores in others, unlike a linear sum.  Each factor h_i
+        # is a "health fraction" in (0, 1] derived from a sigmoid:
+        #   h = e^(-signal / scale)   (1 = pristine, → 0 = worst)
+        # Weights sum to 1 and encode relative importance.
+        def _health_factor(value, scale):
+            """Sigmoid health factor: 1 for no issues, → 0 for many."""
+            return math.exp(-value / scale) if scale > 0 else 1.0
+
         god_critical = sum(1 for g in god_items if g.get("severity") == "CRITICAL")
-        health_score -= min(20, god_critical * 5 + len(god_items) * 1)
+        god_signal = god_critical * 3 + len(god_items) * 0.5
         bn_critical = sum(1 for b in bn_items if b.get("severity") == "CRITICAL")
-        health_score -= min(15, bn_critical * 3 + len(bn_items) * 0.5)
-        health_score -= min(15, len(violations) * 2)
+        bn_signal = bn_critical * 2 + len(bn_items) * 0.3
+
+        # (factor, weight) — weights sum to 1.0
+        _health_factors = [
+            (_health_factor(tangle_ratio, 10), 0.30),      # tangle ratio
+            (_health_factor(god_signal, 5), 0.20),          # god components
+            (_health_factor(bn_signal, 4), 0.15),           # bottlenecks
+            (_health_factor(len(violations), 5), 0.15),     # layer violations
+        ]
+        # File-level health: map avg [0-10] to a factor
         try:
             avg_file_health = conn.execute(
                 "SELECT AVG(health_score) FROM file_stats WHERE health_score IS NOT NULL"
             ).fetchone()[0]
             if avg_file_health is not None:
-                health_score -= max(0, (10 - avg_file_health) * 2)
+                _health_factors.append((min(1.0, avg_file_health / 10.0), 0.20))
+            else:
+                _health_factors.append((1.0, 0.20))
         except Exception:
-            pass
-        health_score = max(0, min(100, int(health_score)))
+            _health_factors.append((1.0, 0.20))
+
+        # Weighted geometric mean in log space
+        log_score = sum(w * math.log(max(h, 1e-9)) for h, w in _health_factors)
+        health_score = max(0, min(100, int(100 * math.exp(log_score))))
 
         # --- Verdict ---
         if health_score >= 80:
@@ -284,6 +342,53 @@ def health(ctx, no_framework):
         else:
             verdict = f"Unhealthy codebase ({health_score}/100) — {sev_counts['CRITICAL']} critical, {sev_counts['WARNING']} warnings"
 
+        if sarif_mode:
+            from roam.output.sarif import health_to_sarif, write_sarif
+            issues = {
+                "cycles": [
+                    {
+                        "size": c["size"],
+                        "severity": c.get("severity", "WARNING"),
+                        "symbols": [s["name"] for s in c["symbols"]],
+                        "files": c["files"],
+                    }
+                    for c in formatted_cycles
+                ],
+                "god_components": [
+                    {
+                        "name": g["name"],
+                        "kind": g["kind"],
+                        "degree": g["degree"],
+                        "file": g["file"],
+                        "severity": g.get("severity", "WARNING"),
+                    }
+                    for g in god_items
+                ],
+                "bottlenecks": [
+                    {
+                        "name": b["name"],
+                        "kind": b["kind"],
+                        "betweenness": b["betweenness"],
+                        "file": b["file"],
+                        "severity": b.get("severity", "WARNING"),
+                    }
+                    for b in bn_items
+                ],
+                "layer_violations": [
+                    {
+                        "severity": "WARNING",
+                        "source": v_lookup.get(v["source"], {}).get("name", "?"),
+                        "source_layer": v["source_layer"],
+                        "target": v_lookup.get(v["target"], {}).get("name", "?"),
+                        "target_layer": v["target_layer"],
+                    }
+                    for v in violations
+                ],
+            }
+            sarif = health_to_sarif(issues)
+            click.echo(write_sarif(sarif))
+            return
+
         if json_mode:
             j_issue_count = len(cycles) + len(god_items) + len(bn_items) + len(violations)
             click.echo(to_json(json_envelope("health",
@@ -291,11 +396,15 @@ def health(ctx, no_framework):
                     "verdict": verdict,
                     "health_score": health_score,
                     "tangle_ratio": tangle_ratio,
+                    "propagation_cost": prop_cost,
+                    "algebraic_connectivity": fiedler,
                     "issue_count": j_issue_count,
                     "severity": sev_counts,
                 },
                 health_score=health_score,
                 tangle_ratio=tangle_ratio,
+                propagation_cost=prop_cost,
+                algebraic_connectivity=fiedler,
                 issue_count=j_issue_count,
                 severity=sev_counts,
                 framework_filtered=filtered_count,
@@ -362,6 +471,8 @@ def health(ctx, no_framework):
             parts.append(f"{len(violations)} layer violation{'s' if len(violations) != 1 else ''}")
         click.echo(f"Health Score: {health_score}/100  |  "
                    f"Tangle: {tangle_ratio}% ({len(cycle_symbol_ids)}/{total_symbols} symbols in cycles)")
+        click.echo(f"Propagation Cost: {prop_cost:.1%}  |  "
+                   f"Algebraic Connectivity: {fiedler:.4f}")
         click.echo()
         if issue_count == 0:
             click.echo("Issues: None detected")

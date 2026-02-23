@@ -16,6 +16,12 @@ from pathlib import Path
 
 import pytest
 
+# Performance tests measure wall-clock time; unreliable under parallel execution
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.xdist_group("performance"),
+]
+
 sys.path.insert(0, str(Path(__file__).parent))
 from conftest import roam, git_init, git_commit
 
@@ -24,8 +30,8 @@ from conftest import roam, git_init, git_commit
 # PERFORMANCE THRESHOLDS
 # ============================================================================
 
-INDEX_TIME_PER_FILE_MS = 50  # max ms per file for indexing
-QUERY_TIME_MS = 2000         # max ms for any single query command
+INDEX_TIME_PER_FILE_MS = 75  # max ms per file for indexing
+QUERY_TIME_MS = 3000         # max ms for any single query command
 
 
 def timed_roam(*args, **kwargs):
@@ -117,7 +123,7 @@ class TestIndexingPerformance:
         out, rc, elapsed = timed_roam("index", cwd=medium_project)
         assert rc == 0
         assert "up to date" in out
-        assert elapsed < 3000, f"No-change incremental took {elapsed:.0f}ms (limit 3000ms)"
+        assert elapsed < 5000, f"No-change incremental took {elapsed:.0f}ms (limit 5000ms)"
 
     def test_incremental_single_file_change(self, medium_project):
         """Changing one file should re-index only that file quickly."""

@@ -1,5 +1,163 @@
 # Changelog
 
+## v8.3.0
+
+C# Tier 1 language support with dedicated parser.
+
+### C# Tier 1 Extractor
+
+- **New `CSharpExtractor`** (`src/roam/languages/csharp_lang.py`) -- dedicated Tier 1 parser for C# (`.cs` files), replacing the generic Tier 2 walker. ~1,000 lines.
+- **Fixed C# grammar alias** -- added `"c_sharp": "csharp"` to `GRAMMAR_ALIASES` in `parser.py`. Without this, ALL `.cs` files silently failed to parse (tree-sitter-language-pack expects `"csharp"`, not `"c_sharp"`). C# parsing now works for the first time.
+
+### Symbols
+
+- Classes, interfaces, structs, enums, records (including record structs)
+- Methods, constructors (including primary constructors, C# 12), destructors
+- Fields (with const/static/readonly detection), properties (with get/set/init accessors and `required` modifier)
+- Delegates, events (both declaration and field-like), indexers
+- Local functions, operator overloads, conversion operators
+- Namespace-qualified names for both block-scoped and file-scoped namespaces
+- Generic signatures with type parameter constraints (truncated at 200 chars)
+- Class modifiers in signatures (static, sealed, abstract, partial, readonly, unsafe, file)
+- Async method detection in signatures
+- XML doc comment extraction (`///` chains)
+- Context-dependent visibility defaults (top-level=internal, nested=private, interface/enum members=public)
+- Compound modifier handling (`protected internal`, `private protected`)
+
+### References
+
+- Using directives: standard, static, alias, and global variants
+- Method/function calls via `invocation_expression`
+- Constructor calls via `object_creation_expression`
+- Inheritance classification: positional heuristic on `base_list` (first non-I-prefixed entry = `inherits`, rest = `implements`)
+- Attribute references as `type_ref` from `attribute_list` (`[HttpGet]`, `[Authorize]`, etc.)
+- Nullable type unwrapping: `IService?`, `List<IHandler>?` produce `type_ref` edges (builtins like `string?` skipped)
+- `catch` clause exception type references (`catch (InvalidOperationException)`)
+- `typeof()` expression type references
+- `is` pattern and `as` cast type references
+- Cast expression type references
+
+### Registration
+
+- Added `"c_sharp"` to `_DEDICATED_EXTRACTORS` in `registry.py`
+- Removed `c_sharp` fallback configs from `generic_lang.py` (`_EXTENDS_CONFIG`, `_TRAIT_CONFIG`, `_PROPERTY_CONFIG`)
+
+### Polish (post-PR)
+
+- Fixed `CSharpConvention.languages` to include `"c_sharp"` (the actual DB language key) so convention-based test discovery works with `affected-tests`
+- Changed attribute references from `call` to `type_ref` (attributes are type annotations, not invocations)
+- Optimized `_detect_frameworks` in `cmd_understand.py` to scan only a sample of files (LIMIT 200) instead of all files
+- Moved `re` and `fnmatch` imports to module level in `cmd_understand.py`
+
+### Real-World Validation
+
+- Tested on demand-ordering-api (~1,550 C# files): 20,061 symbols, 6,890 edges in 15s
+- Symbol breakdown: method=6,270, class=4,801, constructor=3,920, field=1,939, module=1,397, property=765, constant=683, delegate=135, interface=111, enum=40
+- Tier 2 baseline was 0 symbols (grammar alias bug). Tier 1 = 20,061 symbols.
+
+## v8.2.0
+
+Self-analysis driven improvements: ran roam on itself, fixed every discrepancy and false positive it surfaced.
+
+### Bug Fixes
+
+- **Fixed dead export count discrepancy** -- `roam understand` reported 1967 dead exports vs `roam dead --summary` reporting 190. Root cause: `collect_metrics()` in metrics_history.py used raw UNREFERENCED_EXPORTS query without test-file filtering. Now consistent.
+- **Fixed alerts health score mismatch** -- `roam alerts` showed health_score=26 while `roam health` showed 38. Replaced simple penalty-based formula in `collect_metrics()` with weighted geometric mean matching `cmd_health.py`.
+- **Fixed patterns command self-detection** -- `roam patterns` was detecting its own detector functions (`_detect_factory`, `_detect_middleware`, `_detect_decorator`) as pattern instances. Added `_is_test_or_detector_path()` filter that excludes test files and `cmd_patterns.py` itself.
+- **Fixed middleware false positives** -- Removed `%Handler` and `%Filter` from middleware SQL patterns, keeping only genuine middleware indicators (`%Middleware`, `%Interceptor`, `%Pipe`, `%Pipeline`).
+
+### Improved Analysis
+
+- **Smarter health scoring** -- Added `_NON_PRODUCTION_PATH_PATTERNS` in `cmd_health.py` to classify `dev/`, `tests/`, `scripts/`, `benchmark/`, `conftest.py` as expected utilities rather than actionable god-components or bottlenecks.
+- **File role: dev/ as scripts** -- Added `dev/` directory pattern to `file_roles.py` classifier, correctly assigning `ROLE_SCRIPTS` to development tools.
+- **Python extractor: with-statement references** -- Context managers (`with open_db() as conn:`) now produce call edges to the context manager function.
+- **Python extractor: raise references** -- `raise ValueError(...)` and `raise StopIteration` now produce call edges to the exception type.
+- **Python extractor: except clause references** -- `except CustomError as e:` now produces type_ref edges. Handles single types, tuples, as-patterns, and dotted attributes.
+
+### Dead Code Removal
+
+- Removed 5 unused functions: `condense_cycles`, `layer_balance`, `find_path`, `build_reverse_adj`, `get_symbol_blame` (total: ~200 lines).
+
+### Testing
+
+- 1729 tests across 30 test files (up from 1691 across 29)
+- New test file: `test_v82_features.py` (38 tests covering with/except/raise extraction, metrics consistency, pattern filtering, health scoring, file roles, dead code removal)
+
+## v8.1.1
+
+Deep Python extractor improvements based on Pyan, PyCG, and Scalpel research.
+
+### Python Extractor
+
+- **Instance attribute extraction** -- `self.x = value` assignments in `__init__` now produce property symbols. Detects self-name from first parameter (Pyan-inspired, not hardcoded to `self`). Recurses into `if`/`try`/`with` blocks. Deduplicates with class-level properties.
+- **Assignment type annotation references** -- Class fields (`path: Path`), module variables (`cache: Dict[str, Config]`), and instance attributes (`self.x: List[Item] = []`) with type annotations now create `type_ref` edges.
+- **Forward reference support** -- String annotations like `Optional["Config"]` and `"module.ClassName"` now produce `type_ref` edges. Validates that string content is a valid identifier before creating references.
+
+### Testing
+
+- 1691 tests across 29 test files (up from 1664 across 28)
+- New test file: `test_python_extractor_v2.py` (27 tests covering instance attrs, self-name detection, deduplication, assignment type refs, forward refs)
+
+## v8.1.0
+
+Self-analysis driven improvements: ran roam on itself and fixed every issue it surfaced.
+
+### Bug Fixes
+
+- **Fixed `complexity` command crash** -- `roam complexity` crashed with `IndexError` on databases missing v7.4 columns (`cyclomatic_density`, `halstead_*`). Now uses defensive `_safe_metric()` accessor with graceful fallback.
+- **Fixed CHANGELOG v8.0.0** -- Incorrectly listed `roam anomalies` as a standalone command. The anomaly detection shipped as `roam trend --analyze` (with `--anomalies`, `--forecast`, `--fail-on-anomaly`, `--sensitivity`).
+
+### Improved Analysis
+
+- **Smarter health scoring** -- Expanded utility path detection to recognize `output/`, `db/`, `common/`, `internal/`, `infra/` directories and utility files (`resolve.py`, `helpers.py`, `base.py`). Shared infrastructure symbols are now properly categorized as expected utilities instead of false god-component alerts.
+- **95% fewer dead code false positives** -- Test files (`test_*.py`) now excluded from dead export analysis. ABC method overrides, CLI command functions, and dynamically-loaded symbols correctly marked as intentional. Total false reports dropped from 668 to ~131.
+- **Python extractor: decorator references** -- `@decorator` and `@module.decorator(args)` now create reference edges, enabling accurate decorator dependency tracking.
+- **Python extractor: type annotation references** -- Function parameter types (`x: SomeClass`), return types (`-> Result`), and generic type arguments (`List[Item]`) now create `type_ref` edges. Builtin types (`int`, `str`, etc.) are excluded.
+
+## v8.0.1
+
+Project organization and code quality improvements.
+
+### Refactoring
+
+- **Extracted `graph_helpers.py`** -- Deduplicated BFS/adjacency code from 4 command files (`cmd_coverage_gaps`, `cmd_entry_points`, `cmd_safe_zones`, `cmd_context`) into shared `build_forward_adj`, `build_reverse_adj`, `bfs_reachable`, `bfs_nx` helpers.
+- **Split `cmd_context.py`** -- Extracted 13 data-gathering functions into `context_helpers.py`, reducing cmd_context.py from 1,622 to 1,022 lines.
+- **Renamed `test_new_features.py`** to `test_v6_features.py` for naming consistency.
+
+### Infrastructure
+
+- Added Python 3.9 to CI matrix (matches `requires-python = ">=3.9"`).
+- Added `[tool.pytest.ini_options]`, `[tool.ruff]`, and `[project.optional-dependencies]` dev extras to pyproject.toml.
+- Added `Makefile` with install, dev, test, lint, format, build, publish, clean targets.
+- Moved `roam-bench.py` to `dev/` directory.
+
+## v8.0.0
+
+Major release: anomaly detection, file role classification, dead code aging, cross-language bridges, gate presets, test convention adapters, and massive test suite expansion.
+
+### New Capabilities
+
+- **Anomaly detection** (`src/roam/graph/anomaly.py`) -- Statistical anomaly detection using Modified Z-Score, Theil-Sen regression, Mann-Kendall trend test, and CUSUM change-point detection. Surfaces outlier symbols and files across multiple metrics.
+- **File role classifier** (`src/roam/index/file_roles.py`) -- Smart classifier that assigns roles (source, test, config, docs, build, generated, etc.) to files based on path patterns, naming conventions, and content heuristics.
+- **Dead code aging** -- Dead exports now include git blame age data, showing how long dead code has been accumulating. Helps prioritize cleanup by staleness.
+- **Cross-language bridges** (`src/roam/bridges/`) -- Abstract `LanguageBridge` infrastructure for resolving symbols across language boundaries. Includes Salesforce bridge (Apex to Aura/LWC/Visualforce) and Protobuf bridge (.proto to Go/Java/Python stubs).
+- **Gate presets** (`src/roam/commands/gate_presets.py`) -- Framework-specific gate rules for `coverage-gaps`. Built-in presets for Python, JavaScript, Go, Java, and Rust. Custom rules via `.roam-gates.yml`.
+- **Test convention adapters** (`src/roam/index/test_conventions.py`) -- Pluggable test naming adapters for Python, Go, JavaScript, Java, Ruby, and Apex. Improves test discovery in `test-map` and `impact` commands.
+
+### Enhanced Commands
+
+- **`roam trend --analyze`** -- Full anomaly analysis: Modified Z-Score outlier detection, Theil-Sen trend estimation, Mann-Kendall significance testing, CUSUM change-point detection, and linear forecasting. Also available as `--anomalies`, `--forecast`, `--fail-on-anomaly`, `--sensitivity=[low|medium|high]`.
+
+### Testing
+
+- **1656 total tests passing** (up from 669 in v7.5.0)
+- New test files: `test_anomaly.py`, `test_file_roles.py`, `test_pr_risk_author.py`, `test_dead_aging.py`, `test_bridges.py`, `test_test_conventions.py`, `test_gate_presets.py`
+
+### Infrastructure
+
+- 12 research-backed math improvements across core analysis modules (v7.5.0)
+- Enhanced PR risk scoring with author experience factor
+
 ## v7.4.0
 
 Multi-repo workspace support: group sibling repos, detect cross-repo REST API connections, and run unified analysis commands.

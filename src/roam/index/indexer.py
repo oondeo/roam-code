@@ -14,6 +14,7 @@ from roam.index.symbols import extract_symbols, extract_references
 from roam.index.relations import resolve_references, build_file_edges
 from roam.index.incremental import get_changed_files, file_hash
 from roam.languages.generic_lang import GenericExtractor
+from roam.index.file_roles import classify_file
 
 
 def _compute_complexity(source: bytes) -> float:
@@ -80,8 +81,17 @@ def _try_import_git_stats():
         return None
 
 
+def _try_import_effects():
+    """Try to import the effect classification module."""
+    try:
+        from roam.analysis.effects import compute_and_store_effects
+        return compute_and_store_effects
+    except ImportError:
+        return None
+
+
 def _log(msg: str):
-    print(msg, file=sys.stderr)
+    print(msg, file=sys.stderr, flush=True)
 
 
 def _compute_file_health_scores(conn):
@@ -102,8 +112,6 @@ def _compute_file_health_scores(conn):
     files = conn.execute("SELECT id, path FROM files").fetchall()
     if not files:
         return
-
-    file_ids = [r["id"] for r in files]
 
     # Max complexity per file
     max_cc_by_file = {}
@@ -174,8 +182,14 @@ def _compute_file_health_scores(conn):
 
     # Compute churn percentiles for amplification
     churns = sorted(s["churn"] for s in stats.values() if s["churn"] > 0)
-    churn_p50 = churns[len(churns) // 2] if churns else 1
-    churn_p90 = churns[int(len(churns) * 0.9)] if churns else 1
+    if churns:
+        n = len(churns)
+        k50 = (n - 1) * 0.5
+        churn_p50 = churns[int(k50)] + (k50 - int(k50)) * (churns[min(int(k50) + 1, n - 1)] - churns[int(k50)])
+        k90 = (n - 1) * 0.9
+        churn_p90 = churns[int(k90)] + (k90 - int(k90)) * (churns[min(int(k90) + 1, n - 1)] - churns[int(k90)])
+    else:
+        churn_p50, churn_p90 = 1, 1
 
     # Compute health score per file
     updates = []
@@ -363,6 +377,68 @@ def _compute_cognitive_load(conn):
     _log(f"  Cognitive load for {len(updates)} files")
 
 
+def _store_symbols(conn, file_id, rel_path, symbols, all_symbol_rows):
+    """Insert extracted symbols into the DB and populate all_symbol_rows."""
+    for sym in symbols:
+        parent_id = None
+        if sym["parent_name"]:
+            parent_row = conn.execute(
+                "SELECT id FROM symbols WHERE file_id = ? AND name = ?",
+                (file_id, sym["parent_name"]),
+            ).fetchone()
+            if parent_row:
+                parent_id = parent_row["id"]
+
+        conn.execute(
+            """INSERT INTO symbols
+               (file_id, name, qualified_name, kind, signature,
+                line_start, line_end, docstring, visibility,
+                is_exported, parent_id, default_value)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                file_id, sym["name"], sym["qualified_name"],
+                sym["kind"], sym["signature"],
+                sym["line_start"], sym["line_end"],
+                sym["docstring"], sym["visibility"],
+                1 if sym["is_exported"] else 0, parent_id,
+                sym.get("default_value"),
+            ),
+        )
+        row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        if not row:
+            continue
+        sym_id = row[0]
+        all_symbol_rows[sym_id] = {
+            "id": sym_id,
+            "file_id": file_id,
+            "file_path": rel_path,
+            "name": sym["name"],
+            "qualified_name": sym["qualified_name"],
+            "kind": sym["kind"],
+            "is_exported": bool(sym.get("is_exported")),
+            "line_start": sym["line_start"],
+        }
+
+
+def _relink_annotations(conn):
+    """Re-link annotations to current symbol IDs via qualified_name.
+
+    After reindex, symbol IDs change.  This function updates the
+    ``symbol_id`` column of annotations that have a ``qualified_name``
+    recorded, matching them against the new symbols table.
+    """
+    try:
+        conn.execute(
+            "UPDATE annotations SET symbol_id = ("
+            "  SELECT s.id FROM symbols s "
+            "  WHERE s.qualified_name = annotations.qualified_name "
+            "  LIMIT 1"
+            ") WHERE qualified_name IS NOT NULL"
+        )
+    except Exception:
+        pass  # Table may not exist yet
+
+
 class Indexer:
     """Orchestrates the full indexing pipeline."""
 
@@ -371,12 +447,15 @@ class Indexer:
             project_root = find_project_root()
         self.root = Path(project_root).resolve()
 
-    def run(self, force: bool = False, verbose: bool = False):
+    def run(self, force: bool = False, verbose: bool = False,
+            include_excluded: bool = False):
         """Run the indexing pipeline.
 
         Args:
             force: If True, re-index all files. Otherwise, only changed files.
             verbose: If True, show detailed warnings during indexing.
+            include_excluded: If True, skip .roamignore / config / built-in
+                exclusion filtering.
         """
         _log(f"Indexing {self.root}")
 
@@ -400,33 +479,258 @@ class Indexer:
 
         lock_path.write_text(str(os.getpid()))
         try:
-            self._do_run(force, verbose=verbose)
+            self._do_run(force, verbose=verbose,
+                         include_excluded=include_excluded)
         finally:
             try:
                 lock_path.unlink()
             except OSError:
                 pass
 
-    def _do_run(self, force: bool, verbose: bool = False):
+    def _extract_file_refs(self, rel_path, full_path, language, source,
+                           symbols, tree, parsed_source, extractor,
+                           all_references, verbose):
+        """Extract references from a single file (calls, imports, inheritance)."""
+        refs = extract_references(tree, parsed_source, rel_path, extractor)
+        for ref in refs:
+            ref["source_file"] = rel_path
+        all_references.extend(refs)
+
+        # Vue template scanning
+        if rel_path.endswith(".vue"):
+            tpl_result = extract_vue_template(source if isinstance(source, bytes) else b"")
+            if tpl_result:
+                tpl_content, tpl_start_line = tpl_result
+                known_names = {s["name"] for s in symbols} if symbols else set()
+                tpl_refs = scan_template_references(
+                    tpl_content, tpl_start_line, known_names, rel_path,
+                )
+                all_references.extend(tpl_refs)
+
+        # Generic supplement: inheritance refs Tier 1 extractors may miss
+        if not isinstance(extractor, GenericExtractor) and language and tree is not None:
+            try:
+                generic = GenericExtractor(language=language)
+                generic_refs = generic.extract_references(tree, parsed_source, rel_path)
+                for ref in generic_refs:
+                    if ref.get("kind") in ("inherits", "implements", "uses_trait"):
+                        ref["source_file"] = rel_path
+                        all_references.append(ref)
+            except Exception as e:
+                if verbose:
+                    _log(f"  Warning: generic extractor failed for {rel_path}: {e}")
+
+    def _process_files(self, conn, files_to_process, get_extractor,
+                       compute_complexity_fn, verbose):
+        """Parse, extract symbols, and store per-file data. Returns (all_symbol_rows, all_references, file_id_by_path)."""
+        all_symbol_rows = {}
+        all_references = []
+        file_id_by_path = {}
+
+        for i, rel_path in enumerate(files_to_process, 1):
+            full_path = self.root / rel_path
+            language = detect_language(rel_path)
+
+            if (i % 100 == 0) or (i == len(files_to_process)):
+                _log(f"  Processing {i}/{len(files_to_process)} files...")
+                conn.commit()
+
+            try:
+                with open(full_path, "rb") as f:
+                    source = f.read()
+            except OSError as e:
+                if verbose:
+                    _log(f"  Warning: Could not read {rel_path}: {e}")
+                continue
+
+            line_count = _count_lines(source)
+            complexity = _compute_complexity(source)
+            try:
+                mtime = full_path.stat().st_mtime
+            except OSError:
+                mtime = None
+            fhash = file_hash(full_path)
+
+            content_head = source[:2048].decode("utf-8", errors="replace") if source else None
+            file_role = classify_file(rel_path, content_head)
+
+            conn.execute(
+                "INSERT INTO files (path, language, file_role, hash, mtime, line_count) VALUES (?, ?, ?, ?, ?, ?)",
+                (rel_path, language, file_role, fhash, mtime, line_count),
+            )
+            row = conn.execute("SELECT last_insert_rowid()").fetchone()
+            if not row:
+                _log(f"  Warning: Failed to insert file record for {rel_path}")
+                continue
+            file_id = row[0]
+            file_id_by_path[rel_path] = file_id
+
+            conn.execute(
+                "INSERT OR REPLACE INTO file_stats (file_id, complexity) VALUES (?, ?)",
+                (file_id, complexity),
+            )
+
+            tree, parsed_source, lang = parse_file(full_path, language)
+            if tree is None and parsed_source is None:
+                continue
+
+            extractor = None
+            if get_extractor is not None and lang is not None:
+                try:
+                    extractor = get_extractor(lang)
+                except Exception as e:
+                    if verbose:
+                        _log(f"  Warning: No extractor for {lang}: {e}")
+            if extractor is None:
+                continue
+
+            symbols = extract_symbols(tree, parsed_source, rel_path, extractor)
+            _store_symbols(conn, file_id, rel_path, symbols, all_symbol_rows)
+
+            if compute_complexity_fn is not None and tree is not None:
+                try:
+                    compute_complexity_fn(conn, file_id, tree, parsed_source)
+                except Exception as e:
+                    if verbose:
+                        _log(f"  Warning: complexity analysis failed for {rel_path}: {e}")
+
+            self._extract_file_refs(
+                rel_path, full_path, language, source, symbols,
+                tree, parsed_source, extractor, all_references, verbose,
+            )
+
+        return all_symbol_rows, all_references, file_id_by_path
+
+    def _re_extract_unchanged(self, conn, all_files, files_to_process,
+                              removed, get_extractor, all_references,
+                              verbose):
+        """Re-extract references from unchanged files for incremental edge rebuild."""
+        processed_set = set(files_to_process) | set(removed)
+        unchanged = [p for p in all_files if p not in processed_set]
+        if not unchanged:
+            return
+        _log(f"Re-extracting references from {len(unchanged)} unchanged files...")
+        conn.execute("DELETE FROM edges")
+        conn.execute("DELETE FROM file_edges")
+
+        for rel_path in unchanged:
+            full_path = self.root / rel_path
+            language = detect_language(rel_path)
+            tree, parsed_source, lang = parse_file(full_path, language)
+            if tree is None and parsed_source is None:
+                continue
+            extractor = None
+            if get_extractor is not None and lang is not None:
+                try:
+                    extractor = get_extractor(lang)
+                except Exception as e:
+                    if verbose:
+                        _log(f"  Warning: no extractor for {lang}: {e}")
+            if extractor is None:
+                continue
+            try:
+                symbols = extractor.extract_symbols(tree, parsed_source, rel_path)
+            except Exception as e:
+                symbols = []
+                if verbose:
+                    _log(f"  Warning: re-extract symbols failed for {rel_path}: {e}")
+
+            # Read raw source for Vue template scanning
+            raw_source = None
+            if rel_path.endswith(".vue"):
+                from roam.index.parser import read_source
+                raw_source = read_source(full_path)
+
+            self._extract_file_refs(
+                rel_path, full_path, language, raw_source or b"", symbols,
+                tree, parsed_source, extractor, all_references, verbose,
+            )
+
+    @staticmethod
+    def _backup_annotations(db_path):
+        """Read all annotations from the DB before force-reindex deletes it."""
+        import gc
+        import sqlite3
+        if not db_path.exists():
+            return []
+        conn = None
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=10)
+            conn.row_factory = sqlite3.Row
+            # Check if annotations table exists
+            tables = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='annotations'"
+            ).fetchone()
+            if not tables:
+                return []
+            rows = conn.execute("SELECT * FROM annotations").fetchall()
+            result = [dict(r) for r in rows]
+        except Exception:
+            return []
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            del conn
+            gc.collect()  # Release file handles on Windows
+
+        # Also write to JSON backup for crash safety
+        backup_path = db_path.parent / "annotations_backup.json"
+        try:
+            import json
+            backup_path.write_text(
+                json.dumps(result, default=str), encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+        return result
+
+    @staticmethod
+    def _restore_annotations(conn, saved):
+        """Re-insert saved annotations and re-link to new symbol IDs."""
+        if not saved:
+            return
+        for ann in saved:
+            conn.execute(
+                "INSERT INTO annotations "
+                "(qualified_name, file_path, tag, content, author, "
+                " created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    ann.get("qualified_name"),
+                    ann.get("file_path"),
+                    ann.get("tag"),
+                    ann["content"],
+                    ann.get("author"),
+                    ann.get("created_at"),
+                    ann.get("expires_at"),
+                ),
+            )
+        _relink_annotations(conn)
+        _log(f"  Restored {len(saved)} annotations")
+
+    def _do_run(self, force: bool, verbose: bool = False,
+                include_excluded: bool = False):
         t0 = time.monotonic()
-        # 1. Discover files
         _log("Discovering files...")
-        all_files = discover_files(self.root)
+        all_files = discover_files(self.root, include_excluded=include_excluded)
         _log(f"  Found {len(all_files)} files")
 
-        # Delete existing DB when forcing — handles corrupted databases
+        saved_annotations = []
         if force:
             db_path = get_db_path(self.root)
             if db_path.exists():
+                saved_annotations = self._backup_annotations(db_path)
                 db_path.unlink()
-                # Also remove WAL/SHM files if they exist
                 for suffix in ("-wal", "-shm"):
                     wal = db_path.parent / (db_path.name + suffix)
                     if wal.exists():
                         wal.unlink()
 
         with open_db(project_root=self.root) as conn:
-            # 2. Determine what needs indexing
             if force:
                 added = all_files
                 modified = []
@@ -441,167 +745,37 @@ class Indexer:
 
             _log(f"  {len(added)} added, {len(modified)} modified, {len(removed)} removed")
 
-            # Remove deleted/modified files from DB (will cascade)
             for path in removed + modified:
                 row = conn.execute("SELECT id FROM files WHERE path = ?", (path,)).fetchone()
                 if row:
-                    conn.execute("DELETE FROM files WHERE id = ?", (row["id"],))
+                    fid = row["id"]
+                    # Clean up tables with non-cascading FKs before deleting file
+                    sym_ids = [r[0] for r in conn.execute(
+                        "SELECT id FROM symbols WHERE file_id = ?", (fid,)
+                    ).fetchall()]
+                    if sym_ids:
+                        ph = ",".join("?" for _ in sym_ids)
+                        for cleanup_sql in [
+                            f"DELETE FROM symbol_tfidf WHERE symbol_id IN ({ph})",
+                            f"UPDATE runtime_stats SET symbol_id = NULL WHERE symbol_id IN ({ph})",
+                            f"UPDATE vulnerabilities SET matched_symbol_id = NULL WHERE matched_symbol_id IN ({ph})",
+                        ]:
+                            try:
+                                conn.execute(cleanup_sql, sym_ids)
+                            except Exception:
+                                pass  # Table may not exist in older DBs
+                    conn.execute("DELETE FROM files WHERE id = ?", (fid,))
 
-            # Get extractor factory
             get_extractor = _try_import_get_extractor()
-            compute_complexity = _try_import_complexity()
+            compute_complexity_fn = _try_import_complexity()
 
-            # 3-6. Parse, extract, and store for each file
+            # 3-6. Parse, extract, store
             files_to_process = added + modified
-            all_symbol_rows = {}   # symbol_id -> symbol dict
-            all_references = []
-            file_id_by_path = {}
+            all_symbol_rows, all_references, file_id_by_path = self._process_files(
+                conn, files_to_process, get_extractor, compute_complexity_fn, verbose,
+            )
 
-            for i, rel_path in enumerate(files_to_process, 1):
-                full_path = self.root / rel_path
-                language = detect_language(rel_path)
-
-                if (i % 100 == 0) or (i == len(files_to_process)):
-                    _log(f"  Processing {i}/{len(files_to_process)} files...")
-
-                # Read source for metadata
-                try:
-                    with open(full_path, "rb") as f:
-                        source = f.read()
-                except OSError as e:
-                    if verbose:
-                        _log(f"  Warning: Could not read {rel_path}: {e}")
-                    continue
-
-                line_count = _count_lines(source)
-                complexity = _compute_complexity(source)
-                try:
-                    mtime = full_path.stat().st_mtime
-                except OSError:
-                    mtime = None
-                fhash = file_hash(full_path)
-
-                # Insert file record
-                conn.execute(
-                    "INSERT INTO files (path, language, hash, mtime, line_count) VALUES (?, ?, ?, ?, ?)",
-                    (rel_path, language, fhash, mtime, line_count),
-                )
-                row = conn.execute("SELECT last_insert_rowid()").fetchone()
-                if not row:
-                    _log(f"  Warning: Failed to insert file record for {rel_path}")
-                    continue
-                file_id = row[0]
-                file_id_by_path[rel_path] = file_id
-
-                # Store file stats (complexity)
-                conn.execute(
-                    "INSERT OR REPLACE INTO file_stats (file_id, complexity) VALUES (?, ?)",
-                    (file_id, complexity),
-                )
-
-                # Parse with tree-sitter (or regex-only: tree=None, source available)
-                tree, parsed_source, lang = parse_file(full_path, language)
-                if tree is None and parsed_source is None:
-                    continue
-
-                # Get language extractor
-                extractor = None
-                if get_extractor is not None and lang is not None:
-                    try:
-                        extractor = get_extractor(lang)
-                    except Exception as e:
-                        if verbose:
-                            _log(f"  Warning: No extractor for {lang}: {e}")
-                        extractor = None
-
-                if extractor is None:
-                    continue
-
-                # Extract symbols
-                symbols = extract_symbols(tree, parsed_source, rel_path, extractor)
-
-                for sym in symbols:
-                    parent_id = None
-                    if sym["parent_name"]:
-                        # Look up parent in symbols already inserted for this file
-                        parent_row = conn.execute(
-                            "SELECT id FROM symbols WHERE file_id = ? AND name = ?",
-                            (file_id, sym["parent_name"]),
-                        ).fetchone()
-                        if parent_row:
-                            parent_id = parent_row["id"]
-
-                    conn.execute(
-                        """INSERT INTO symbols
-                           (file_id, name, qualified_name, kind, signature,
-                            line_start, line_end, docstring, visibility,
-                            is_exported, parent_id, default_value)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            file_id, sym["name"], sym["qualified_name"],
-                            sym["kind"], sym["signature"],
-                            sym["line_start"], sym["line_end"],
-                            sym["docstring"], sym["visibility"],
-                            1 if sym["is_exported"] else 0, parent_id,
-                            sym.get("default_value"),
-                        ),
-                    )
-                    row = conn.execute("SELECT last_insert_rowid()").fetchone()
-                    if not row:
-                        continue
-                    sym_id = row[0]
-                    all_symbol_rows[sym_id] = {
-                        "id": sym_id,
-                        "file_id": file_id,
-                        "file_path": rel_path,
-                        "name": sym["name"],
-                        "qualified_name": sym["qualified_name"],
-                        "kind": sym["kind"],
-                        "is_exported": bool(sym.get("is_exported")),
-                        "line_start": sym["line_start"],
-                    }
-
-                # Compute per-symbol complexity metrics
-                if compute_complexity is not None:
-                    try:
-                        compute_complexity(conn, file_id, tree, parsed_source)
-                    except Exception as e:
-                        if verbose:
-                            _log(f"  Warning: complexity analysis failed for {rel_path}: {e}")
-
-                # Extract references
-                refs = extract_references(tree, parsed_source, rel_path, extractor)
-                for ref in refs:
-                    ref["source_file"] = rel_path
-                all_references.extend(refs)
-
-                # Vue template scanning: find identifiers in <template> that
-                # reference <script setup> bindings
-                if rel_path.endswith(".vue"):
-                    tpl_result = extract_vue_template(source)
-                    if tpl_result:
-                        tpl_content, tpl_start_line = tpl_result
-                        known_names = {s["name"] for s in symbols}
-                        tpl_refs = scan_template_references(
-                            tpl_content, tpl_start_line, known_names, rel_path,
-                        )
-                        all_references.extend(tpl_refs)
-
-                # Supplement: run generic extractor for inheritance refs
-                # that Tier 1 extractors may miss (requires tree-sitter AST)
-                if not isinstance(extractor, GenericExtractor) and language and tree is not None:
-                    try:
-                        generic = GenericExtractor(language=language)
-                        generic_refs = generic.extract_references(tree, parsed_source, rel_path)
-                        for ref in generic_refs:
-                            if ref.get("kind") in ("inherits", "implements", "uses_trait"):
-                                ref["source_file"] = rel_path
-                                all_references.append(ref)
-                    except Exception as e:
-                        if verbose:
-                            _log(f"  Warning: generic extractor failed for {rel_path}: {e}")
-
-            # Also load existing symbols from DB (for incremental)
+            # Load existing symbols for incremental
             if not force:
                 existing_rows = conn.execute(
                     "SELECT s.id, s.file_id, s.name, s.qualified_name, s.kind, "
@@ -622,78 +796,17 @@ class Indexer:
                             "line_start": row["line_start"],
                         }
 
-            # Load all file_id_by_path from DB
             for row in conn.execute("SELECT id, path FROM files").fetchall():
                 file_id_by_path[row["path"]] = row["id"]
 
-            # Fix incremental edge loss: when files are modified, their old
-            # symbols are deleted (CASCADE removes edges). We need to
-            # re-extract references from unchanged files to restore
-            # cross-file edges pointing to the modified files' new symbols.
+            # Fix incremental edge loss
             if not force and modified:
-                processed_set = set(files_to_process) | set(removed)
-                unchanged = [p for p in all_files if p not in processed_set]
-                if unchanged:
-                    _log(f"Re-extracting references from {len(unchanged)} unchanged files...")
-                    # Delete ALL edges and file_edges — we rebuild them entirely
-                    # from all_references (unchanged + modified files).
-                    conn.execute("DELETE FROM edges")
-                    conn.execute("DELETE FROM file_edges")
+                self._re_extract_unchanged(
+                    conn, all_files, files_to_process, removed,
+                    get_extractor, all_references, verbose,
+                )
 
-                    for rel_path in unchanged:
-                        full_path = self.root / rel_path
-                        language = detect_language(rel_path)
-                        tree, parsed_source, lang = parse_file(full_path, language)
-                        if tree is None and parsed_source is None:
-                            continue
-                        extractor = None
-                        if get_extractor is not None and lang is not None:
-                            try:
-                                extractor = get_extractor(lang)
-                            except Exception as e:
-                                if verbose:
-                                    _log(f"  Warning: no extractor for {lang}: {e}")
-                        if extractor is None:
-                            continue
-                        # Call extract_symbols first to populate _pending_inherits
-                        # (JS/TS extractors accumulate inheritance refs during symbol extraction)
-                        try:
-                            extractor.extract_symbols(tree, parsed_source, rel_path)
-                        except Exception as e:
-                            if verbose:
-                                _log(f"  Warning: re-extract symbols failed for {rel_path}: {e}")
-                        refs = extract_references(tree, parsed_source, rel_path, extractor)
-                        for ref in refs:
-                            ref["source_file"] = rel_path
-                        all_references.extend(refs)
-                        # Vue template scanning for unchanged files
-                        if rel_path.endswith(".vue"):
-                            from roam.index.parser import read_source
-                            raw_source = read_source(full_path)
-                            if raw_source:
-                                tpl_result = extract_vue_template(raw_source)
-                                if tpl_result:
-                                    tpl_content, tpl_start_line = tpl_result
-                                    syms = extractor.extract_symbols(tree, parsed_source, rel_path)
-                                    known_names = {s["name"] for s in syms}
-                                    tpl_refs = scan_template_references(
-                                        tpl_content, tpl_start_line, known_names, rel_path,
-                                    )
-                                    all_references.extend(tpl_refs)
-                        # Generic supplement for unchanged files too (requires tree-sitter AST)
-                        if not isinstance(extractor, GenericExtractor) and language and tree is not None:
-                            try:
-                                generic = GenericExtractor(language=language)
-                                generic_refs = generic.extract_references(tree, parsed_source, rel_path)
-                                for ref in generic_refs:
-                                    if ref.get("kind") in ("inherits", "implements", "uses_trait"):
-                                        ref["source_file"] = rel_path
-                                        all_references.append(ref)
-                            except Exception as e:
-                                if verbose:
-                                    _log(f"  Warning: generic extractor failed for {rel_path}: {e}")
-
-            # 6. Resolve references into edges
+            # Resolve references into edges
             _log("Resolving references...")
             symbols_by_name: dict[str, list[dict]] = {}
             for sym in all_symbol_rows.values():
@@ -701,15 +814,13 @@ class Indexer:
 
             symbol_edges = resolve_references(all_references, symbols_by_name, file_id_by_path)
 
-            # Store symbol edges
             conn.executemany(
                 "INSERT INTO edges (source_id, target_id, kind, line) VALUES (?, ?, ?, ?)",
                 [(e["source_id"], e["target_id"], e["kind"], e["line"]) for e in symbol_edges],
             )
-
             _log(f"  {len(symbol_edges)} symbol edges")
 
-            # 7. Build file edges
+            # Build file edges
             _log("Building file-level edges...")
             file_edges = build_file_edges(symbol_edges, all_symbol_rows)
             conn.executemany(
@@ -719,7 +830,7 @@ class Indexer:
             )
             _log(f"  {len(file_edges)} file edges")
 
-            # 8. Compute graph metrics (optional)
+            # Graph metrics
             build_symbol_graph, _store_metrics, _detect_clusters, _label_clusters, _store_clusters = _try_import_graph()
             G = None
             if build_symbol_graph is not None:
@@ -734,7 +845,7 @@ class Indexer:
             else:
                 _log("Skipping graph metrics (module not available)")
 
-            # 9. Git history analysis (optional)
+            # Git history
             analyze_git = _try_import_git_stats()
             if analyze_git is not None:
                 _log("Analyzing git history...")
@@ -745,7 +856,7 @@ class Indexer:
             else:
                 _log("Skipping git analysis (module not available)")
 
-            # 10. Compute clusters (optional)
+            # Clusters
             if _detect_clusters is not None and G is not None:
                 _log("Computing clusters...")
                 try:
@@ -758,27 +869,65 @@ class Indexer:
             else:
                 _log("Skipping clustering (module not available)")
 
-            # 11. Compute per-file health scores
+            # Effect classification + propagation
+            _effects_fn = _try_import_effects()
+            if _effects_fn is not None:
+                _log("Classifying symbol effects...")
+                try:
+                    _effects_fn(conn, self.root, G)
+                    effect_count = conn.execute(
+                        "SELECT COUNT(*) FROM symbol_effects"
+                    ).fetchone()[0]
+                    if effect_count:
+                        _log(f"  {effect_count} effects classified")
+                except Exception as e:
+                    _log(f"  Effect analysis failed: {e}")
+
+            # Per-file health scores
             _log("Computing per-file health scores...")
             try:
                 _compute_file_health_scores(conn)
             except Exception as e:
                 _log(f"  Health score computation failed: {e}")
 
-            # 12. Compute cognitive load index
+            # Cognitive load index
             _log("Computing cognitive load index...")
             try:
                 _compute_cognitive_load(conn)
             except Exception as e:
                 _log(f"  Cognitive load computation failed: {e}")
 
-            # Log parse error summary
+            # Annotation survival
+            if force and saved_annotations:
+                _log("Restoring annotations...")
+                try:
+                    self._restore_annotations(conn, saved_annotations)
+                except Exception as e:
+                    _log(f"  Annotation restore failed: {e}")
+            elif not force:
+                # Re-link annotations after incremental reindex
+                try:
+                    _relink_annotations(conn)
+                except Exception:
+                    pass
+
+            # TF-IDF semantic search vectors
+            _log("Building TF-IDF vectors...")
+            try:
+                from roam.search.index_embeddings import build_and_store_tfidf
+                build_and_store_tfidf(conn)
+                tfidf_count = conn.execute(
+                    "SELECT COUNT(*) FROM symbol_tfidf"
+                ).fetchone()[0]
+                _log(f"  TF-IDF vectors for {tfidf_count} symbols")
+            except Exception as e:
+                _log(f"  TF-IDF build failed (non-fatal): {e}")
+
             from roam.index.parser import get_parse_error_summary
             error_summary = get_parse_error_summary()
             if error_summary:
                 _log(f"  Parse issues: {error_summary}")
 
-            # Summary
             elapsed = time.monotonic() - t0
             file_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
             sym_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]

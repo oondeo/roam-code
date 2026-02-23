@@ -10,7 +10,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-from tree_sitter_language_pack import get_language, get_parser
+from tree_sitter_language_pack import get_parser
 
 # Map file extensions to tree-sitter language names
 EXTENSION_MAP = {
@@ -62,7 +62,9 @@ EXTENSION_MAP = {
     ".yml": "yaml",
     ".toml": "toml",
     ".json": "json",
+    ".jsonc": "jsonc",
     ".md": "markdown",
+    ".mdx": "mdx",
     ".sql": "sql",
     ".tf": "hcl",
     ".hcl": "hcl",
@@ -85,18 +87,21 @@ EXTENSION_MAP = {
 # This allows languages with similar syntax to piggyback on available grammars
 # without requiring a dedicated tree-sitter parser.
 GRAMMAR_ALIASES = {
+    # C# (tree-sitter-language-pack uses "csharp", not "c_sharp")
+    "c_sharp": "csharp",
     # Salesforce
     "apex": "java",
     "sfxml": "html",          # SF metadata XML → HTML parser (close enough for structure)
     "aura": "html",
     "visualforce": "html",
-    # Future candidates:
-    # "jsonc": "json",
-    # "mdx": "markdown",
+    # JSONC (JSON with comments) → json grammar
+    "jsonc": "json",
+    # MDX (Markdown + JSX) → markdown grammar
+    "mdx": "markdown",
 }
 
 # Languages that use regex-only extraction (no tree-sitter grammar)
-REGEX_ONLY_LANGUAGES = frozenset({"foxpro"})
+REGEX_ONLY_LANGUAGES = frozenset({"foxpro", "yaml", "hcl"})
 
 # Track parse error stats
 parse_errors = {"no_grammar": 0, "parse_error": 0, "unreadable": 0}
@@ -193,7 +198,6 @@ def _preprocess_vue(source: bytes) -> tuple[bytes, str]:
 
         # Find the line range for the script content (excluding the tags)
         block_start = text[:match.start()].count("\n")
-        block_end = text[:match.end()].count("\n")
 
         # Find the opening tag end line and closing tag start line
         inner_text = match.group(0)

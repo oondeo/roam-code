@@ -7,7 +7,6 @@ import logging
 import math
 import sqlite3
 import subprocess
-import time as _time
 from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
@@ -271,11 +270,18 @@ def _compute_cochange_entropy(
     conn: sqlite3.Connection,
     pair_counts: dict[tuple[int, int], int],
 ):
-    """Compute Shannon entropy of co-change distribution per file.
+    """Compute Renyi entropy (order 2) of co-change distribution per file.
+
+    Uses Renyi entropy H2 = -log2(sum(p_i^2)) instead of Shannon entropy.
+    Renyi-2 is more robust to outlier partners (one-off co-changes) and
+    gives more weight to the dominant co-change pattern, making it a better
+    discriminator for "shotgun surgery" detection.
 
     High entropy = file changes with many different partners (shotgun surgery).
     Low entropy = file changes with a consistent set of partners (focused).
     Stored as normalized entropy [0, 1] in file_stats.cochange_entropy.
+
+    Reference: Renyi (1961), "On Measures of Entropy and Information."
     """
     # Aggregate: for each file, sum co-change counts per partner
     file_partners: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
@@ -289,11 +295,13 @@ def _compute_cochange_entropy(
         if total == 0 or len(partners) <= 1:
             updates.append((0.0, fid))
             continue
-        entropy = 0.0
+        # Renyi entropy of order 2: H2 = -log2(sum(p_i^2))
+        sum_p_sq = 0.0
         for count in partners.values():
             p = count / total
-            if p > 0:
-                entropy -= p * math.log2(p)
+            sum_p_sq += p * p
+        entropy = -math.log2(sum_p_sq) if sum_p_sq > 0 else 0.0
+        # Normalize: max Renyi-2 entropy = log2(N) (uniform distribution)
         max_entropy = math.log2(len(partners))
         norm_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
         updates.append((round(norm_entropy, 4), fid))
@@ -337,7 +345,6 @@ def _populate_hyperedges(
             ).hexdigest()[:16]
 
             edge_id += 1
-            pair_count = n * (n - 1) // 2
             edge_batch.append((edge_id, commit_id, n, sig))
 
             for ordinal, fid in enumerate(sorted_ids):
@@ -542,70 +549,6 @@ def get_blame_for_file(
             })
 
     return entries
-
-
-def get_symbol_blame(
-    conn: sqlite3.Connection, project_root: Path, symbol_id: int
-) -> dict:
-    """Get aggregated blame info for a symbol's line range.
-
-    Returns a dict keyed by author::
-
-        {
-            "author_name": {
-                "lines": int,
-                "commits": set_count,
-                "first_date": int (epoch),
-                "last_date": int (epoch),
-            }
-        }
-    """
-    row = conn.execute(
-        "SELECT s.line_start, s.line_end, f.path "
-        "FROM symbols s JOIN files f ON s.file_id = f.id "
-        "WHERE s.id = ?",
-        (symbol_id,),
-    ).fetchone()
-    if row is None:
-        return {}
-
-    line_start = row[0] if not isinstance(row, sqlite3.Row) else row["line_start"]
-    line_end = row[1] if not isinstance(row, sqlite3.Row) else row["line_end"]
-    file_path = row[2] if not isinstance(row, sqlite3.Row) else row["path"]
-
-    if line_start is None or line_end is None:
-        return {}
-
-    blame = get_blame_for_file(project_root, file_path)
-    if not blame:
-        return {}
-
-    # Filter to the symbol's line range (1-indexed)
-    relevant = blame[line_start - 1: line_end]
-
-    authors: dict[str, dict] = {}
-    for entry in relevant:
-        author = entry["author"]
-        if author not in authors:
-            authors[author] = {
-                "lines": 0,
-                "commits": set(),
-                "first_date": entry["timestamp"],
-                "last_date": entry["timestamp"],
-            }
-        info = authors[author]
-        info["lines"] += 1
-        info["commits"].add(entry["commit_hash"])
-        if entry["timestamp"] < info["first_date"]:
-            info["first_date"] = entry["timestamp"]
-        if entry["timestamp"] > info["last_date"]:
-            info["last_date"] = entry["timestamp"]
-
-    # Convert commit sets to counts for JSON-friendliness
-    for info in authors.values():
-        info["commits"] = len(info["commits"])
-
-    return authors
 
 
 # ---------------------------------------------------------------------------

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json as _json
-import os
 import time
 from datetime import datetime, timezone
+
+# Envelope schema versioning (semver: major.minor.patch)
+ENVELOPE_SCHEMA_VERSION = "1.0.0"
+ENVELOPE_SCHEMA_NAME = "roam-envelope-v1"
 
 KIND_ABBREV = {
     "function": "fn",
@@ -87,9 +90,10 @@ def format_table(headers: list[str], rows: list[list[str]],
     if not rows:
         return "(none)"
     widths = [len(h) for h in headers]
+    num_cols = len(widths)
     for row in rows:
         for i, cell in enumerate(row):
-            if i < len(widths):
+            if i < num_cols:
                 widths[i] = max(widths[i], len(str(cell)))
     lines = []
     header_line = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
@@ -141,6 +145,8 @@ def json_envelope(command: str, summary: dict | None = None, **payload) -> dict:
     )
 
     out: dict = {
+        "schema": ENVELOPE_SCHEMA_NAME,
+        "schema_version": ENVELOPE_SCHEMA_VERSION,
         "command": command,
         "version": version,
         "timestamp": ts,

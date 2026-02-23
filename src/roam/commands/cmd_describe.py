@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections import Counter
+from pathlib import Path
 
 import click
 
@@ -151,7 +152,7 @@ def _section_architecture(conn):
 
         if layers:
             layer_counts = Counter(layers.values())
-            lines.append(f"- **Layer distribution:** " +
+            lines.append("- **Layer distribution:** " +
                          ", ".join(f"L{k}: {v} symbols" for k, v in sorted(layer_counts.items())[:5]))
     except Exception:
         lines.append("Architecture analysis not available (graph module not loaded).")
@@ -161,7 +162,6 @@ def _section_architecture(conn):
 def _section_testing(conn):
     """Test directories, test file count, test-to-source ratio."""
     lines = ["", "## Testing", ""]
-    test_patterns = ["test_", "_test.", ".test.", ".spec.", "tests/", "test/", "__tests__/", "spec/"]
     files = conn.execute("SELECT path FROM files").fetchall()
     all_paths = [f["path"].replace("\\", "/") for f in files]
 
@@ -194,16 +194,88 @@ def _section_testing(conn):
     return lines
 
 
+def _read_manifest_info(project_root):
+    """Read package name/description from manifest files."""
+    if not project_root:
+        return []
+    import json
+    lines = []
+    for manifest in ("package.json", "composer.json"):
+        mpath = project_root / manifest
+        if not mpath.exists():
+            continue
+        try:
+            data = json.loads(mpath.read_text(encoding="utf-8"))
+            desc = data.get("description", "")
+            name = data.get("name", "")
+            if desc:
+                lines.append(f"- **Package:** {name}")
+                lines.append(f"- **Description:** {desc}")
+        except Exception:
+            pass
+        break
+
+    for manifest in ("pyproject.toml",):
+        mpath = project_root / manifest
+        if not mpath.exists():
+            continue
+        try:
+            text = mpath.read_text(encoding="utf-8")
+            for line in text.splitlines():
+                if line.strip().startswith("description"):
+                    desc = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if desc:
+                        lines.append(f"- **Description:** {desc}")
+                    break
+        except Exception:
+            pass
+        break
+    return lines
+
+
+_DOMAIN_STOP_WORDS = frozenset({
+    # Generic programming
+    "get", "set", "new", "init", "create", "make", "build", "run", "test",
+    "handle", "process", "parse", "format", "check", "has", "the",
+    "from", "with", "for", "add", "remove", "delete", "update", "find",
+    "load", "save", "read", "write", "send", "resolve", "validate", "setup",
+    "use", "can", "should", "will", "not", "all", "any", "map", "list",
+    "item", "data", "type", "name", "value", "key", "index", "count",
+    "result", "response", "request", "error", "node", "path", "base",
+    "util", "utils", "helper", "helpers", "model", "models",
+    # UI / framework
+    "props", "emit", "emits", "ref", "computed", "watch", "reactive",
+    "component", "view", "render", "mount", "unmount", "click",
+    "submit", "change", "input", "select", "close", "open", "show",
+    "hide", "toggle", "modal", "form", "field", "row", "col",
+    "icon", "btn", "wrapper", "slot", "class", "style",
+    "define", "expose", "provide", "inject",
+    # Vue/React/Angular
+    "state", "store", "action", "dispatch", "reducer",
+    "effect", "callback", "memo", "context", "hook",
+    # DOM events / UI interactions
+    "click", "focus", "blur", "hover", "scroll", "resize",
+    "keydown", "keyup", "keypress", "mousedown", "mouseup", "mouseover",
+    "mouseenter", "mouseleave", "touchstart", "touchend", "touchmove",
+    "drag", "drop", "dropdown", "popover", "tooltip", "overlay",
+    "collapse", "expand", "visible", "disabled", "active", "selected",
+    "loading", "loaded", "pending", "ready", "mounted", "updated",
+    "before", "after", "enter", "leave", "transition", "animate",
+    "width", "height", "size", "offset", "position", "layout",
+    "container", "content", "header", "footer", "sidebar", "panel",
+    "tab", "tabs", "menu", "nav", "link", "button", "label", "text",
+    "image", "avatar", "badge", "card", "dialog", "drawer", "divider",
+    # Generic code patterns
+    "fetch", "query", "execute", "apply", "call", "bind",
+    "start", "stop", "reset", "clear", "filter", "sort",
+    "default", "config", "options", "params", "args",
+})
+
+
 def _section_domain(conn):
     """Infer project domain from symbol names and manifest files."""
     import re
     lines = ["", "## Domain Keywords", ""]
-
-    # Check for manifest files with descriptions
-    root_files = conn.execute(
-        "SELECT path FROM files WHERE path NOT LIKE '%/%'"
-    ).fetchall()
-    root_set = {f["path"] for f in root_files}
 
     project_root = None
     try:
@@ -212,89 +284,20 @@ def _section_domain(conn):
     except Exception:
         pass
 
-    if project_root:
-        import json
-        for manifest in ("package.json", "composer.json"):
-            mpath = project_root / manifest
-            if mpath.exists():
-                try:
-                    data = json.loads(mpath.read_text(encoding="utf-8"))
-                    desc = data.get("description", "")
-                    name = data.get("name", "")
-                    if desc:
-                        lines.append(f"- **Package:** {name}")
-                        lines.append(f"- **Description:** {desc}")
-                except Exception:
-                    pass
-                break
+    lines.extend(_read_manifest_info(project_root))
 
-        for manifest in ("pyproject.toml",):
-            mpath = project_root / manifest
-            if mpath.exists():
-                try:
-                    text = mpath.read_text(encoding="utf-8")
-                    for line in text.splitlines():
-                        if line.strip().startswith("description"):
-                            desc = line.split("=", 1)[1].strip().strip('"').strip("'")
-                            if desc:
-                                lines.append(f"- **Description:** {desc}")
-                            break
-                except Exception:
-                    pass
-                break
-
-    # Extract domain words from symbol names
     symbols = conn.execute(
         "SELECT name FROM symbols WHERE kind IN ('function', 'class', 'method', 'interface', 'struct') LIMIT 2000"
     ).fetchall()
 
     word_counts: dict[str, int] = {}
     _split_re = re.compile(r'[A-Z][a-z]+|[a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)')
-    _stop = {
-        # Generic programming
-        "get", "set", "new", "init", "create", "make", "build", "run", "test",
-        "handle", "process", "parse", "format", "check", "has", "the",
-        "from", "with", "for", "add", "remove", "delete", "update", "find",
-        "load", "save", "read", "write", "send", "resolve", "validate", "setup",
-        "use", "can", "should", "will", "not", "all", "any", "map", "list",
-        "item", "data", "type", "name", "value", "key", "index", "count",
-        "result", "response", "request", "error", "node", "path", "base",
-        "util", "utils", "helper", "helpers", "model", "models",
-        # UI / framework
-        "props", "emit", "emits", "ref", "computed", "watch", "reactive",
-        "component", "view", "render", "mount", "unmount", "click",
-        "submit", "change", "input", "select", "close", "open", "show",
-        "hide", "toggle", "modal", "form", "field", "row", "col",
-        "icon", "btn", "wrapper", "slot", "class", "style",
-        "define", "expose", "provide", "inject",
-        # Vue/React/Angular
-        "state", "store", "action", "dispatch", "reducer",
-        "effect", "callback", "memo", "context", "hook",
-        # DOM events / UI interactions
-        "click", "focus", "blur", "hover", "scroll", "resize",
-        "keydown", "keyup", "keypress", "mousedown", "mouseup", "mouseover",
-        "mouseenter", "mouseleave", "touchstart", "touchend", "touchmove",
-        "drag", "drop", "dropdown", "popover", "tooltip", "overlay",
-        "collapse", "expand", "visible", "disabled", "active", "selected",
-        "loading", "loaded", "pending", "ready", "mounted", "updated",
-        "before", "after", "enter", "leave", "transition", "animate",
-        "width", "height", "size", "offset", "position", "layout",
-        "container", "content", "header", "footer", "sidebar", "panel",
-        "tab", "tabs", "menu", "nav", "link", "button", "label", "text",
-        "image", "avatar", "badge", "card", "dialog", "drawer", "divider",
-        # Generic code patterns
-        "fetch", "query", "execute", "apply", "call", "bind",
-        "start", "stop", "reset", "clear", "filter", "sort",
-        "default", "config", "options", "params", "args",
-    }
     for s in symbols:
-        parts = _split_re.findall(s["name"])
-        for p in parts:
+        for p in _split_re.findall(s["name"]):
             w = p.lower()
-            if len(w) >= 3 and w not in _stop:
+            if len(w) >= 3 and w not in _DOMAIN_STOP_WORDS:
                 word_counts[w] = word_counts.get(w, 0) + 1
 
-    # Score: frequency × length bonus (longer words = more domain-specific)
     top_words = sorted(
         word_counts.items(),
         key=lambda x: -(x[1] * (1 + max(0, len(x[0]) - 4) * 0.15)),
@@ -648,6 +651,28 @@ def _format_agent_prompt(data: dict) -> str:
     return "\n".join(lines)
 
 
+# Roam usage instructions prepended to written agent config files.
+# Mirrors the "Copy-paste agent instructions" block in the README.
+_ROAM_USAGE_INSTRUCTIONS = """\
+## Codebase navigation with roam
+
+This project uses `roam` for codebase comprehension. Always prefer roam \
+over Glob/Grep/Read exploration.
+
+Before modifying any code:
+1. First time in the repo: `roam understand` then `roam tour`
+2. Find a symbol: `roam search <pattern>`
+3. Before changing a symbol: `roam preflight <name>` (blast radius + tests + fitness)
+4. Need files to read: `roam context <name>` (files + line ranges, prioritized)
+5. Debugging a failure: `roam diagnose <name>` (root cause ranking)
+6. After making changes: `roam diff` (blast radius of uncommitted changes)
+
+Additional commands: `roam health` (0-100 score), `roam impact <name>` (what breaks),
+`roam pr-risk` (PR risk score), `roam file <path>` (file skeleton).
+
+Run `roam --help` for all commands. Use `roam --json <cmd>` for structured output.
+"""
+
 # Agent config file detection order — first existing file wins.
 # If none exist, fall back to CLAUDE.md (most common).
 _AGENT_CONFIG_FILES = [
@@ -741,7 +766,9 @@ def describe(ctx, write, force, agent_prompt, out_file):
             click.echo(f"{out_path.name} already exists at {out_path}")
             click.echo("Use --force to overwrite, or omit --write to print to stdout.")
             return
-        out_path.write_text(output, encoding="utf-8")
+        # Prepend roam usage instructions so AI agents know how to use roam
+        write_output = _ROAM_USAGE_INSTRUCTIONS + "\n" + output
+        out_path.write_text(write_output, encoding="utf-8")
         click.echo(f"Wrote {out_path}")
     else:
         click.echo(output)

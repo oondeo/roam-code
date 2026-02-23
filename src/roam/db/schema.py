@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     path TEXT NOT NULL UNIQUE,
     language TEXT,
+    file_role TEXT DEFAULT 'source',
     hash TEXT,
     mtime REAL,
     line_count INTEGER DEFAULT 0
@@ -31,7 +32,9 @@ CREATE TABLE IF NOT EXISTS edges (
     source_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
     target_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
     kind TEXT NOT NULL,
-    line INTEGER
+    line INTEGER,
+    bridge TEXT,
+    confidence REAL
 );
 
 CREATE TABLE IF NOT EXISTS file_edges (
@@ -136,11 +139,59 @@ CREATE TABLE IF NOT EXISTS symbol_metrics (
     line_count INTEGER DEFAULT 0,
     return_count INTEGER DEFAULT 0,
     bool_op_count INTEGER DEFAULT 0,
-    callback_depth INTEGER DEFAULT 0
+    callback_depth INTEGER DEFAULT 0,
+    cyclomatic_density REAL DEFAULT 0,
+    halstead_volume REAL DEFAULT 0,
+    halstead_difficulty REAL DEFAULT 0,
+    halstead_effort REAL DEFAULT 0,
+    halstead_bugs REAL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_symbol_metrics_complexity
     ON symbol_metrics(cognitive_complexity DESC);
+
+-- Math signals: AST-derived signals for algorithm detection
+CREATE TABLE IF NOT EXISTS math_signals (
+    symbol_id INTEGER PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
+    loop_depth INTEGER DEFAULT 0,
+    has_nested_loops INTEGER DEFAULT 0,
+    calls_in_loops TEXT,
+    subscript_in_loops INTEGER DEFAULT 0,
+    has_self_call INTEGER DEFAULT 0,
+    loop_with_compare INTEGER DEFAULT 0,
+    loop_with_accumulator INTEGER DEFAULT 0,
+    self_call_count INTEGER DEFAULT 0,
+    str_concat_in_loop INTEGER DEFAULT 0,
+    loop_invariant_calls TEXT,
+    loop_bound_small INTEGER DEFAULT 0
+);
+
+-- Agentic memory: persistent annotations on symbols and files
+CREATE TABLE IF NOT EXISTS annotations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+    qualified_name TEXT,
+    file_path TEXT,
+    tag TEXT,
+    content TEXT NOT NULL,
+    author TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    expires_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_annotations_symbol ON annotations(symbol_id);
+CREATE INDEX IF NOT EXISTS idx_annotations_qname ON annotations(qualified_name);
+CREATE INDEX IF NOT EXISTS idx_annotations_file ON annotations(file_path);
+CREATE INDEX IF NOT EXISTS idx_annotations_tag ON annotations(tag);
+
+-- Symbol effects: what functions DO (side-effect classification)
+CREATE TABLE IF NOT EXISTS symbol_effects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    effect_type TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'direct'
+);
+CREATE INDEX IF NOT EXISTS idx_symbol_effects_symbol ON symbol_effects(symbol_id);
+CREATE INDEX IF NOT EXISTS idx_symbol_effects_type ON symbol_effects(effect_type);
 
 -- Snapshots: health metrics over time
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -162,5 +213,48 @@ CREATE TABLE IF NOT EXISTS snapshots (
     tangle_ratio REAL,
     avg_complexity REAL,
     brain_methods INTEGER
+);
+
+-- Runtime trace statistics: ingested from OpenTelemetry/Jaeger/Zipkin/generic traces
+CREATE TABLE IF NOT EXISTS runtime_stats (
+    id INTEGER PRIMARY KEY,
+    symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+    symbol_name TEXT,
+    file_path TEXT,
+    trace_source TEXT,
+    call_count INTEGER DEFAULT 0,
+    p50_latency_ms REAL,
+    p99_latency_ms REAL,
+    error_rate REAL DEFAULT 0.0,
+    last_seen TEXT,
+    ingested_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_stats_symbol ON runtime_stats(symbol_id);
+CREATE INDEX IF NOT EXISTS idx_runtime_stats_name ON runtime_stats(symbol_name);
+
+-- Security: vulnerability tracking and reachability
+CREATE TABLE IF NOT EXISTS vulnerabilities (
+    id INTEGER PRIMARY KEY,
+    cve_id TEXT,
+    package_name TEXT NOT NULL,
+    severity TEXT,
+    title TEXT,
+    source TEXT,
+    matched_symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+    matched_file TEXT,
+    reachable INTEGER DEFAULT 0,
+    shortest_path TEXT,
+    hop_count INTEGER,
+    ingested_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_vuln_cve ON vulnerabilities(cve_id);
+CREATE INDEX IF NOT EXISTS idx_vuln_package ON vulnerabilities(package_name);
+CREATE INDEX IF NOT EXISTS idx_vuln_symbol ON vulnerabilities(matched_symbol_id);
+
+-- TF-IDF vectors for semantic search
+CREATE TABLE IF NOT EXISTS symbol_tfidf (
+    symbol_id INTEGER PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
+    terms TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now'))
 );
 """
